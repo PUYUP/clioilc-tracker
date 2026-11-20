@@ -1,0 +1,9 @@
+[package]
+name = "clioilc-gemini"
+version.workspace = true
+edition.workspace = true
+description = "clioilc reader for ~/.gemini"
+
+[dependencies]
+anyhow.workspace = true
+clioilc-core.workspace = true

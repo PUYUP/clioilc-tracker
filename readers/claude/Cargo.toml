@@ -1,0 +1,13 @@
+[package]
+name = "clioilc-claude"
+version.workspace = true
+edition.workspace = true
+description = "clioilc reader for ~/.claude/projects"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clioilc-core.workspace = true
+memchr.workspace = true
+serde.workspace = true
+serde_json.workspace = true
