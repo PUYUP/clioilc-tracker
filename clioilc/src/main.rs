@@ -1,3 +1,4 @@
+mod cloud;
 mod commands;
 mod readers;
 
@@ -9,7 +10,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "clioilc",
-    about = "Track file changes from AI tool directories"
+    about = "Track what your AI agents do, locally and on your clioilc dashboard"
 )]
 struct Cli {
     /// Directory where events are stored (default: ~/.clioilc)
@@ -33,7 +34,37 @@ enum Commands {
         /// Also print appended lines to stdout as `<path>\t<line>`
         #[arg(long)]
         follow: bool,
+        /// Also upload new data in the background (requires `clioilc login`)
+        #[arg(long)]
+        sync: bool,
+        /// Seconds between background syncs
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(5..))]
+        sync_every: u64,
     },
+    /// Connect this machine to your clioilc account (approve in the browser)
+    Login {
+        /// Backend URL, e.g. https://api.example.com (default: $CLIOILC_SERVER
+        /// or the server of the previous login)
+        #[arg(long)]
+        server: Option<String>,
+        /// Device name shown in the dashboard (default: hostname)
+        #[arg(long)]
+        name: Option<String>,
+        /// How private data is encrypted, asked on the account's first login.
+        /// Cannot be changed later
+        #[arg(long, value_enum)]
+        mode: Option<commands::login::Mode>,
+        /// Do not ask before rebuilding usage.db with the account's salt
+        #[arg(long)]
+        yes: bool,
+        /// Do not open the browser automatically
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Revoke this machine's token and forget the login (local data is kept)
+    Logout,
+    /// Upload data not yet on the server
+    Sync,
     /// What the agent did on a day: prompts, replies, tool actions (private)
     Activity {
         /// Day to show, YYYY-MM-DD in local time (default: today)
@@ -139,7 +170,33 @@ fn main() -> Result<()> {
             reader,
             path,
             follow,
-        } => commands::watch::run(&open_store(data_dir)?, reader.as_deref(), path, follow),
+            sync,
+            sync_every,
+        } => commands::watch::run(
+            &open_store(data_dir)?,
+            reader.as_deref(),
+            path,
+            follow,
+            sync.then(|| std::time::Duration::from_secs(sync_every)),
+        ),
+        Commands::Login {
+            server,
+            name,
+            mode,
+            yes,
+            no_browser,
+        } => commands::login::login(
+            &open_store(data_dir)?,
+            commands::login::Options {
+                server,
+                name,
+                mode,
+                yes,
+                no_browser,
+            },
+        ),
+        Commands::Logout => commands::login::logout(&open_store(data_dir)?),
+        Commands::Sync => commands::sync::run(&open_store(data_dir)?),
         Commands::Activity {
             date,
             project,

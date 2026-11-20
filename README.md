@@ -33,6 +33,7 @@ cargo run -q --release -- watch --follow \
   - [`history`](#history) dan [`summary`](#summary)
   - [`usage import` / `usage report`](#usage): token usage
   - [`activity`](#activity): apa yang dikerjakan agent hari ini
+  - [`login` / `sync` / `logout`](#login--sync--logout): kirim data ke dashboard
   - [`add mod`](#add-mod): buat reader baru
 - [Format output `--follow`](#format-output---follow)
 - [Contoh pipeline](#contoh-pipeline)
@@ -232,6 +233,64 @@ Activity on 2026-11-20
 Yang disimpan untuk aksi tool hanya **ringkasan**: deskripsi dan perintah Bash, path file
 untuk Read/Edit/Write, URL untuk WebFetch, dan sebagainya. Isi file yang ditulis, teks edit,
 dan output tool yang sukses tidak disimpan.
+
+### `login` / `sync` / `logout`
+
+Menghubungkan mesin ini ke akun clioilc (backend di `../backend`), lalu meng-upload data
+yang belum terkirim. Kontrak lengkapnya ada di repo backend: `docs/sync.md` (payload dan
+protokol), `docs/auth.md` (device flow), dan `docs/encryption.md` (format e2e).
+
+```sh
+./target/release/clioilc login --server https://api.example.com   # sekali per mesin
+./target/release/clioilc sync                                      # upload yang belum terkirim
+./target/release/clioilc watch --sync                              # rekam + sync tiap 30 detik
+./target/release/clioilc logout                                    # cabut token mesin ini
+```
+
+**`login`** memakai device flow. CLI menampilkan kode dan membuka halaman `/device` di
+dashboard. Setelah kamu login dengan GitHub dan menyetujui kodenya, CLI menerima token.
+
+| Opsi | Keterangan |
+|---|---|
+| `--server <URL>` | URL backend. Default `$CLIOILC_SERVER`, atau server dari login sebelumnya. Harus `https://`; `http://` hanya boleh untuk localhost |
+| `--name <NAMA>` | nama perangkat di dashboard (default: hostname) |
+| `--mode server\|e2e` | cara enkripsi data privat; ditanyakan saat login **pertama** akun, tidak bisa diganti |
+| `--yes` | jangan bertanya sebelum membangun ulang `usage.db` (lihat di bawah) |
+| `--no-browser` | jangan buka browser otomatis |
+
+Setiap akun punya satu **salt bersama**, supaya project dan sesi yang sama menghasilkan hash
+yang sama di semua laptop:
+
+- **Perangkat pertama** meng-upload salt miliknya. Data lokalnya tetap berlaku.
+- **Perangkat berikutnya** mengunduh salt akun. Kalau `usage.db`-nya kosong, salt langsung
+  diganti. Kalau sudah berisi data, file itu dipindah ke `usage.db.before-login-<waktu>`,
+  lalu dibangun ulang dari log agent dengan salt akun. Riwayat yang lognya sudah terhapus
+  hanya tersisa di backup. Hentikan `clioilc watch` dulu sebelum login.
+
+Mode enkripsi:
+
+| Mode | Yang terjadi |
+|---|---|
+| `server` | data privat dikirim lewat HTTPS, lalu dienkripsi server saat disimpan |
+| `e2e` | data privat dienkripsi di mesin ini dengan kunci dari passphrase (min. 12 karakter). Passphrase diperlukan di setiap perangkat baru dan di browser. Lupa passphrase berarti data privat hilang |
+
+Untuk skrip atau CI, passphrase bisa diberikan lewat `CLIOILC_PASSPHRASE`.
+
+**`sync`**:
+
+- Mengirim batch berisi 500 baris sampai tidak ada yang tersisa.
+- Baris yang berubah saat sedang dikirim (misalnya hasil tool baru masuk) tetap ditandai
+  belum terkirim, dan ikut di batch berikutnya.
+- Kalau upload gagal atau proses terhenti, baris dikembalikan ke status belum terkirim.
+- Hanya satu proses sync yang bisa berjalan pada satu waktu (`sync.lock`).
+- Sebelum upload, `sync` memastikan `usage.db` memakai salt akun. Kalau tidak, ia menolak
+  dan meminta `login` ulang.
+
+**`watch --sync`** menjalankan sync di background. Interval default 30 detik, bisa diatur
+dengan `--sync-every <detik>`. Error yang sama hanya dicetak sekali.
+
+**`logout`** mencabut token mesin ini di server dan menghapus `auth.json`. Data lokal tetap
+disimpan.
 
 ### `add mod`
 
@@ -443,7 +502,7 @@ Sebelum disimpan, semua teks privat **disensor**, lalu **dipotong**:
   setengah.
 - **Thinking:** hanya yang ada isinya. Sekitar 80% blok thinking di log memang kosong.
 
-### Sync ke dashboard (belum diimplementasikan)
+### Sync ke dashboard
 
 - Tabel **publik** di-upload apa adanya.
 - Tabel **privat** di-upload ke akun pemilik. Setiap user memilih cara perlindungannya:
@@ -453,7 +512,18 @@ Sebelum disimpan, semua teks privat **disensor**, lalu **dipotong**:
 | **End-to-end** | dienkripsi di laptop sebelum dikirim; dashboard membuka isinya di browser dengan kunci/passphrase milik user | server tidak bisa membaca isinya; pencarian teks dilakukan di browser; kunci hilang berarti data privat hilang |
 | **Enkripsi di server** | dikirim lewat HTTPS, server mengenkripsi saat disimpan dan membukanya untuk user yang login | lebih sederhana, pencarian bisa di server; tapi server bisa membaca isinya |
 
-- Tabel **lokal** (`meta`) tidak pernah di-upload.
+- Tabel **lokal** (`meta`) tidak pernah di-upload. Salt-nya tersimpan di akun: terenkripsi
+  oleh server (mode server), atau dienkripsi dengan kunci E2E (mode e2e).
+
+Format E2E (v1). Dashboard memakai format yang sama untuk dekripsi di browser:
+
+- kunci passphrase = Argon2id(passphrase, `kdf.salt`, m=64 MiB, t=3, p=1), 32 byte
+- data key: 32 byte acak, disimpan di server sebagai `seal(kunci passphrase, data key, "clioilc:v1:dek")`
+- salt akun: `seal(data key, salt, "clioilc:v1:salt")`
+- baris privat: `seal(data key, JSON data, "clioilc:v1:<kind>:<id>")`
+- `seal` = `0x01` ‖ nonce 12 byte ‖ AES-256-GCM (ciphertext + tag), string tadi sebagai AAD
+
+Test vector ada di `clioilc/src/cloud/e2e.rs` dan sudah dicek dengan argon2-cffi.
 - Setiap baris yang di-sync punya kolom `synced_at` (`NULL` = belum di-upload), yang di-reset
   kalau barisnya berubah, misalnya hasil tool baru masuk. Primary key-nya hash yang stabil,
   jadi upload ulang bisa di-upsert dengan aman di sisi server.
@@ -471,6 +541,9 @@ Semua ada di `--data-dir` (default `~/.clioilc`):
 | `events.jsonl` | Satu event per baris: `timestamp`, `kind` (`Created`/`Modified`/`Removed`/`Renamed`), `path`, `reader`, `project`, `size` |
 | `offsets.json` | Posisi baca `watch` per file (path, inode, offset). Kalau dihapus, `watch` mulai lagi dari akhir file. |
 | `usage.db` | Token usage dan timeline aktivitas (SQLite), lihat [Database dan privasi](#database-dan-privasi) |
+| `auth.json` | Hasil `login`: server, token perangkat, mode enkripsi, dan (mode e2e) data key. Permission 0600 |
+| `sync.lock` | Mencegah dua `sync` berjalan bersamaan |
+| `usage.db.before-login-*` | Backup saat `login` membangun ulang `usage.db` dengan salt akun |
 
 ## Perilaku dan batasan
 

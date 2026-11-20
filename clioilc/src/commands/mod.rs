@@ -1,7 +1,9 @@
 pub mod activity;
 pub mod add;
 pub mod history;
+pub mod login;
 pub mod summary;
+pub mod sync;
 pub mod usage;
 pub mod watch;
 

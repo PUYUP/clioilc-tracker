@@ -65,6 +65,11 @@ impl Store {
         &self.file
     }
 
+    /// The data directory (holds the event log, usage.db, auth.json, ...).
+    pub fn data_dir(&self) -> &Path {
+        self.file.parent().unwrap_or(Path::new("."))
+    }
+
     /// Where `watch --follow` persists read positions, next to the event log.
     pub fn checkpoint_path(&self) -> PathBuf {
         self.file.with_file_name(CHECKPOINT_FILE)

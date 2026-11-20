@@ -6,10 +6,17 @@ use clioilc_core::Store;
 use std::io::{self, BufWriter, StdoutLock, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
-pub fn run(store: &Store, reader: Option<&str>, path: Option<PathBuf>, follow: bool) -> Result<()> {
+pub fn run(
+    store: &Store,
+    reader: Option<&str>,
+    path: Option<PathBuf>,
+    follow: bool,
+    sync_every: Option<Duration>,
+) -> Result<()> {
     let reader = readers::find(reader)?;
     let dir = match path {
         Some(p) => p,
@@ -33,6 +40,13 @@ pub fn run(store: &Store, reader: Option<&str>, path: Option<PathBuf>, follow: b
         store.path().display(),
         store.usage_db_path().display()
     );
+
+    if let Some(every) = sync_every {
+        // Fail fast on a missing login instead of erroring every interval.
+        crate::cloud::auth::require(store.data_dir())?;
+        eprintln!("syncing every {}s", every.as_secs());
+        super::sync::spawn_loop(Store::new(store.data_dir()), every, &STOP);
+    }
 
     // Appended lines are always read (to collect usage); --follow only
     // decides whether they are also printed.

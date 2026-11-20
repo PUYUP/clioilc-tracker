@@ -21,6 +21,7 @@ use crate::usage::{Message, Prompt, Record, Status, ToolResult, Usage};
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -239,6 +240,8 @@ impl UsageDb {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        // `watch` and `sync` may write at the same time from two connections.
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.execute_batch(SCHEMA)
             .context("creating usage schema")?;
         let salt = load_or_create_salt(&conn)?;
@@ -460,6 +463,92 @@ impl UsageDb {
             .collect()
     }
 
+    /// The hashing salt. Shared by all devices of an account once logged in.
+    pub fn salt(&self) -> &[u8] {
+        &self.salt
+    }
+
+    /// True when no synced table has any row (a fresh database).
+    pub fn is_empty(&self) -> Result<bool> {
+        for table in PUBLIC_TABLES.iter().chain(PRIVATE_TABLES) {
+            let sql = format!("SELECT EXISTS (SELECT 1 FROM {table})");
+            if self.conn.query_row(&sql, [], |r| r.get::<_, bool>(0))? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Use the account's salt instead of the one created for this machine.
+    /// Only allowed while empty: existing ids were hashed with the old salt
+    /// and cannot be re-hashed (the raw values are not stored).
+    pub fn replace_salt(&mut self, salt: &[u8]) -> Result<()> {
+        anyhow::ensure!(salt.len() >= 16, "salt too short");
+        anyhow::ensure!(
+            self.is_empty()?,
+            "cannot change the salt of a non-empty usage.db"
+        );
+        self.commit()?;
+        self.conn
+            .execute("UPDATE meta SET value = ?1 WHERE key = 'salt'", [salt])?;
+        self.salt = salt.to_vec();
+        Ok(())
+    }
+
+    /// Release rows left claimed by an interrupted sync. Call only while
+    /// holding the sync lock.
+    pub fn sync_release(&mut self) -> Result<()> {
+        self.commit()?;
+        for table in PUBLIC_TABLES.iter().chain(PRIVATE_TABLES) {
+            self.conn.execute(
+                &format!("UPDATE {table} SET synced_at = NULL WHERE synced_at = '{SENDING}'"),
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Claim up to `limit` unsynced rows (across all tables) for upload.
+    ///
+    /// Claimed rows are marked `sending`. A row that changes while in
+    /// flight is reset to NULL by its upsert, so [`UsageDb::sync_finish`]
+    /// will not mark it synced and the new version goes in the next batch.
+    pub fn sync_claim(&mut self, limit: usize) -> Result<SyncBatch> {
+        self.commit()?;
+        let tx = self.conn.transaction()?;
+        let mut left = limit;
+        for table in PUBLIC_TABLES.iter().chain(PRIVATE_TABLES) {
+            if left == 0 {
+                break;
+            }
+            left -= tx.execute(
+                &format!(
+                    "UPDATE {table} SET synced_at = '{SENDING}' WHERE rowid IN \
+                     (SELECT rowid FROM {table} WHERE synced_at IS NULL LIMIT ?1)"
+                ),
+                [left as i64],
+            )?;
+        }
+        let batch = read_claimed(&tx)?;
+        tx.commit()?;
+        Ok(batch)
+    }
+
+    /// After an upload: mark claimed rows synced (`ok`) or release them.
+    pub fn sync_finish(&mut self, ok: bool, now: DateTime<Utc>) -> Result<()> {
+        self.commit()?;
+        let value = ok.then(|| now.to_rfc3339_opts(SecondsFormat::Secs, true));
+        let tx = self.conn.transaction()?;
+        for table in PUBLIC_TABLES.iter().chain(PRIVATE_TABLES) {
+            tx.execute(
+                &format!("UPDATE {table} SET synced_at = ?1 WHERE synced_at = '{SENDING}'"),
+                [&value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Keyed hash: stable on this machine, unlinkable to the raw value
     /// without the local salt. 128 bits, hex encoded.
     fn hash(&self, kind: &str, raw: &str) -> String {
@@ -477,6 +566,170 @@ impl Drop for UsageDb {
     fn drop(&mut self) {
         let _ = self.commit();
     }
+}
+
+/// `synced_at` value of rows claimed by a sync in progress.
+const SENDING: &str = "sending";
+
+/// Rows claimed by [`UsageDb::sync_claim`], shaped like the sync API (v1).
+#[derive(Debug, Default, Serialize)]
+pub struct SyncBatch {
+    pub messages: Vec<SyncMessage>,
+    pub tool_calls: Vec<SyncToolCall>,
+    #[serde(skip)]
+    pub private: Vec<SyncPrivate>,
+}
+
+impl SyncBatch {
+    pub fn len(&self) -> usize {
+        self.messages.len() + self.tool_calls.len() + self.private.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncMessage {
+    pub id: String,
+    pub tool: String,
+    pub project_id: String,
+    pub session_id: String,
+    pub is_subagent: bool,
+    pub ts: String,
+    pub model: String,
+    pub status: String,
+    pub input_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub output_tokens: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncToolCall {
+    pub id: String,
+    pub message_id: Option<String>,
+    pub name: Option<String>,
+    pub status: Option<String>,
+}
+
+/// A private row: `kind` and `id` stay in clear, `data` gets encrypted
+/// (by the server or, end-to-end, by the client).
+#[derive(Debug)]
+pub struct SyncPrivate {
+    /// `project`, `prompt`, `block` or `tool_call`.
+    pub kind: &'static str,
+    pub id: String,
+    pub ts: Option<String>,
+    pub data: serde_json::Value,
+}
+
+fn read_claimed(conn: &Connection) -> Result<SyncBatch> {
+    use serde_json::json;
+    let mut batch = SyncBatch::default();
+    let claimed = format!("WHERE synced_at = '{SENDING}'");
+
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, tool, project_id, session_id, is_subagent, ts, model, status, input_tokens,
+                cache_write_tokens, cache_read_tokens, output_tokens FROM messages {claimed}"
+    ))?;
+    batch.messages = stmt
+        .query_map([], |r| {
+            Ok(SyncMessage {
+                id: r.get(0)?,
+                tool: r.get(1)?,
+                project_id: r.get(2)?,
+                session_id: r.get(3)?,
+                is_subagent: r.get(4)?,
+                ts: r.get(5)?,
+                model: r.get(6)?,
+                status: r.get(7)?,
+                input_tokens: r.get(8)?,
+                cache_write_tokens: r.get(9)?,
+                cache_read_tokens: r.get(10)?,
+                output_tokens: r.get(11)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, message_id, name, status FROM tool_calls {claimed}"
+    ))?;
+    batch.tool_calls = stmt
+        .query_map([], |r| {
+            Ok(SyncToolCall {
+                id: r.get(0)?,
+                message_id: r.get(1)?,
+                name: r.get(2)?,
+                status: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut push = |sql: &str, f: &dyn Fn(&rusqlite::Row) -> rusqlite::Result<SyncPrivate>| {
+        let mut stmt = conn.prepare(&format!("{sql} {claimed}"))?;
+        let rows = stmt.query_map([], |r| f(r))?;
+        for row in rows {
+            batch.private.push(row?);
+        }
+        anyhow::Ok(())
+    };
+    push("SELECT project_id, name FROM private_projects", &|r| {
+        Ok(SyncPrivate {
+            kind: "project",
+            id: r.get(0)?,
+            ts: None,
+            data: json!({ "name": r.get::<_, String>(1)? }),
+        })
+    })?;
+    push(
+        "SELECT id, ts, project_id, session_id, is_subagent, text FROM private_prompts",
+        &|r| {
+            Ok(SyncPrivate {
+                kind: "prompt",
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                data: json!({
+                    "project_id": r.get::<_, String>(2)?,
+                    "session_id": r.get::<_, String>(3)?,
+                    "is_subagent": r.get::<_, bool>(4)?,
+                    "text": r.get::<_, String>(5)?,
+                }),
+            })
+        },
+    )?;
+    push(
+        "SELECT id, ts, message_id, kind, text FROM private_blocks",
+        &|r| {
+            Ok(SyncPrivate {
+                kind: "block",
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                data: json!({
+                    "message_id": r.get::<_, String>(2)?,
+                    "kind": r.get::<_, String>(3)?,
+                    "text": r.get::<_, String>(4)?,
+                }),
+            })
+        },
+    )?;
+    push(
+        "SELECT id, ts, full_name, summary, error FROM private_tool_calls",
+        &|r| {
+            Ok(SyncPrivate {
+                kind: "tool_call",
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                data: json!({
+                    "full_name": r.get::<_, Option<String>>(2)?,
+                    "summary": r.get::<_, Option<String>>(3)?,
+                    "error": r.get::<_, Option<String>>(4)?,
+                }),
+            })
+        },
+    )?;
+    Ok(batch)
 }
 
 fn private_ts(ts: DateTime<Utc>) -> String {
@@ -781,5 +1034,113 @@ mod tests {
         db.commit().unwrap();
         assert_eq!(unsynced_messages(&db), 1);
         assert_eq!(db.report(GroupBy::Model).unwrap()[0].usage.output, 9);
+    }
+
+    fn pending(db: &UsageDb) -> u64 {
+        db.unsynced().unwrap().iter().map(|(_, n)| n).sum()
+    }
+
+    #[test]
+    fn sync_claims_in_batches_and_marks_synced() {
+        let mut db = db();
+        db.insert(
+            "claude",
+            Some("app"),
+            &message("m1", "l1", 5, "hi", &[("t1", "Bash", "ls")]),
+        )
+        .unwrap();
+        db.insert("claude", Some("app"), &message("m2", "l2", 5, "", &[]))
+            .unwrap();
+        db.commit().unwrap();
+        let total = pending(&db);
+        assert!(total >= 5, "messages, tool call, project and private rows");
+
+        let first = db.sync_claim(2).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first.messages.len(), 2, "public tables are claimed first");
+        db.sync_finish(true, at(0)).unwrap();
+        assert_eq!(pending(&db), total - 2);
+
+        let rest = db.sync_claim(100).unwrap();
+        assert_eq!(rest.len() as u64, total - 2);
+        let kinds: Vec<_> = rest.private.iter().map(|p| p.kind).collect();
+        assert!(kinds.contains(&"project") && kinds.contains(&"block"));
+        let project = rest.private.iter().find(|p| p.kind == "project").unwrap();
+        assert_eq!(project.data["name"], "app");
+        assert!(project.ts.is_none());
+        db.sync_finish(true, at(0)).unwrap();
+        assert_eq!(pending(&db), 0);
+        assert!(db.sync_claim(100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_or_interrupted_sync_releases_rows() {
+        let mut db = db();
+        db.insert("claude", None, &message("m1", "l1", 5, "", &[]))
+            .unwrap();
+        db.commit().unwrap();
+        let total = pending(&db);
+
+        db.sync_claim(100).unwrap();
+        db.sync_finish(false, at(0)).unwrap();
+        assert_eq!(pending(&db), total);
+
+        db.sync_claim(100).unwrap(); // then the process dies
+        assert_eq!(pending(&db), 0, "claimed rows are not counted as pending");
+        db.sync_release().unwrap();
+        assert_eq!(pending(&db), total);
+    }
+
+    #[test]
+    fn row_changed_while_in_flight_is_sent_again() {
+        let mut db = db();
+        db.insert("claude", None, &message("m1", "l1", 5, "", &[]))
+            .unwrap();
+        db.commit().unwrap();
+        let batch = db.sync_claim(100).unwrap();
+        assert_eq!(batch.messages[0].output_tokens, 5);
+
+        // The watcher sees more output for the same message mid-upload.
+        db.insert("claude", None, &message("m1", "l1", 9, "", &[]))
+            .unwrap();
+        db.commit().unwrap();
+        db.sync_finish(true, at(0)).unwrap();
+
+        let again = db.sync_claim(100).unwrap();
+        assert_eq!(again.messages.len(), 1);
+        assert_eq!(again.messages[0].output_tokens, 9);
+    }
+
+    #[test]
+    fn salt_can_only_be_replaced_while_empty() {
+        let mut db = db();
+        let shared = [7u8; 32];
+        db.replace_salt(&shared).unwrap();
+        assert_eq!(db.salt(), shared);
+        assert!(db.replace_salt(&[1u8; 8]).is_err(), "too short");
+
+        db.insert("claude", Some("app"), &message("m1", "l1", 5, "", &[]))
+            .unwrap();
+        db.commit().unwrap();
+        let id = db.sync_claim(1).unwrap().messages[0].id.clone();
+        assert_eq!(id, db.hash("message", "m1"));
+        assert!(!db.is_empty().unwrap());
+        assert!(db.replace_salt(&[8u8; 32]).is_err());
+        assert_eq!(db.salt(), shared);
+    }
+
+    #[test]
+    fn same_salt_gives_same_ids_on_two_devices() {
+        let mut a = db();
+        let path = std::env::temp_dir().join(format!("clioilc-usage-b-{}.db", std::process::id()));
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+        let mut b = UsageDb::open(&path).unwrap();
+        assert_ne!(a.hash("project", "app"), b.hash("project", "app"));
+        let salt = a.salt().to_vec();
+        b.replace_salt(&salt).unwrap();
+        assert_eq!(a.hash("project", "app"), b.hash("project", "app"));
+        a.commit().unwrap();
     }
 }
