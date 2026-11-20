@@ -57,8 +57,17 @@ pub struct Syncer {
     auth: Auth,
     db: UsageDb,
     data_key: Option<[u8; e2e::KEY_LEN]>,
+    data_dir: std::path::PathBuf,
     _lock: File,
+    /// E2E team sync (commands/team.rs): when it last ran, and its notes.
+    last_team: Option<std::time::Instant>,
+    pub team_notes: Vec<String>,
+    pub team_uploaded: usize,
 }
+
+/// Team sync runs after the personal sync, at most this often unless new
+/// private data arrived.
+const TEAM_EVERY: Duration = Duration::from_secs(300);
 
 impl Syncer {
     /// Fails if not logged in, another sync holds the lock, or usage.db was
@@ -90,7 +99,11 @@ impl Syncer {
             auth,
             db,
             data_key,
+            data_dir: data_dir.to_path_buf(),
             _lock: lock,
+            last_team: None,
+            team_notes: Vec::new(),
+            team_uploaded: 0,
         };
         syncer.check_salt()?;
         Ok(syncer)
@@ -121,8 +134,33 @@ impl Syncer {
         Ok(())
     }
 
-    /// Upload everything pending, batch by batch.
+    /// Upload everything pending, batch by batch, then (E2E accounts) the
+    /// team copies of linked folders.
     pub fn run(&mut self) -> Result<Totals> {
+        let totals = self.run_personal()?;
+        self.team_uploaded = 0;
+        let due = self.last_team.is_none_or(|t| t.elapsed() >= TEAM_EVERY) || totals.private > 0;
+        if let (Some(dek), true) = (self.data_key, due) {
+            self.last_team = Some(std::time::Instant::now());
+            match super::team::sync(&self.client, &mut self.db, &dek, &self.data_dir) {
+                Ok(report) => {
+                    self.team_uploaded = report.uploaded;
+                    self.team_notes = report.notes;
+                }
+                // Never let team sync break the personal sync.
+                Err(err) => self.team_notes = vec![format!("team sync: {err:#}")],
+            }
+        }
+        Ok(totals)
+    }
+
+    /// `clioilc team`: verify teammates, then team sync now.
+    pub fn team(&mut self) -> Result<()> {
+        let dek = *super::team::require_dek(self.data_key.as_ref())?;
+        super::team::run(&self.client, &mut self.db, &dek, &self.data_dir)
+    }
+
+    fn run_personal(&mut self) -> Result<Totals> {
         let mut totals = Totals::default();
         loop {
             let batch = self.db.sync_claim(BATCH)?;
@@ -200,6 +238,12 @@ pub fn run(store: &Store) -> Result<()> {
     } else {
         eprintln!("synced {totals} to {}", syncer.auth.server);
     }
+    if syncer.team_uploaded > 0 {
+        eprintln!("team: {} record(s) shared", syncer.team_uploaded);
+    }
+    for note in &syncer.team_notes {
+        eprintln!("team: {note}");
+    }
     Ok(())
 }
 
@@ -208,11 +252,24 @@ pub fn spawn_loop(store: Store, every: Duration, stop: &'static AtomicBool) {
     std::thread::spawn(move || {
         let mut syncer: Option<Syncer> = None;
         let mut last_error: Option<String> = None;
+        let mut last_notes: Vec<String> = Vec::new();
         while !stop.load(Ordering::SeqCst) {
             let result = match syncer.as_mut() {
                 Some(s) => s.run(),
                 None => Syncer::open(&store).and_then(|s| syncer.insert(s).run()),
             };
+            if let Some(s) = syncer.as_ref() {
+                if s.team_uploaded > 0 {
+                    eprintln!("team: {} record(s) shared", s.team_uploaded);
+                }
+                // Repeat team notes (e.g. "waiting for a key") only when they change.
+                if s.team_notes != last_notes {
+                    for note in &s.team_notes {
+                        eprintln!("team: {note}");
+                    }
+                    last_notes = s.team_notes.clone();
+                }
+            }
             match result {
                 Ok(t) if !t.is_empty() => {
                     eprintln!("sync: {t}");

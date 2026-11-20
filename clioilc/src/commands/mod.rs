@@ -6,6 +6,7 @@ pub mod login;
 pub mod service;
 pub mod summary;
 pub mod sync;
+pub mod team;
 pub mod usage;
 pub mod watch;
 

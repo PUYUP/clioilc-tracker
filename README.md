@@ -319,10 +319,38 @@ cd ~/code/acme-api
   tetap pribadi, kecuali kamu menyalakan berbagi teks untuk proyek itu di dashboard.
 - Satu folder hanya bisa masuk ke satu proyek tim. Akun mode e2e belum bisa link.
 - `--path <folder>` untuk folder selain folder saat ini.
+- **Workspace E2E:** akun E2E hanya bisa link ke workspace E2E, dan akun mode server hanya ke
+  workspace server. Lihat `clioilc team` di bawah.
 - **Tanpa target** (`clioilc link` saja), tracker membaca git remote folder ini lalu
   mencocokkannya dengan git remote proyek tim yang boleh kamu link (diisi admin di
   dashboard). Pencocokan dilakukan di laptop: remote foldermu tidak dikirim ke server.
   Kalau cocok dengan satu proyek, kamu ditanya dulu sebelum di-link.
+
+### `team` (workspace E2E)
+
+Untuk akun E2E di workspace E2E (`backend/docs/e2e-teams.md`). Data tim dienkripsi di laptop
+dengan kunci proyek, dan server hanya menyimpan ciphertext.
+
+```bash
+./target/release/clioilc team
+#   you: @alice  fingerprint 3F9A 21C0 7B44 …
+#   acme: key from @bob  fingerprint 91DE …
+#   Does @bob see exactly this fingerprint on their Account page? [y/N]
+```
+
+- **Pertama kali**, perintah ini membuat **identitas tim** (pasangan kunci X-Wing dan
+  Ed25519, terkunci dengan kunci data akunmu) dan menampilkan fingerprint-nya. Berikan
+  fingerprint itu ke pengelola workspace lewat jalur lain (chat, tatap muka), supaya ia bisa
+  memberimu kunci.
+- **Kunci dari rekan setim** baru dipakai setelah kamu mencocokkan fingerprint-nya dan menjawab
+  `y`. Hasil verifikasi disimpan di `~/.clioilc/pins.json` (0600). Kalau kunci rekan itu
+  berubah, sync berhenti memakainya dan meminta verifikasi ulang.
+- **Sync tim** juga berjalan otomatis setelah `clioilc sync` dan `watch --sync` (paling sering
+  setiap 5 menit, atau segera ada data privat baru). Yang dibagikan: aksi tool, ditambah
+  prompt dan balasan kalau berbagi teks dinyalakan untuk proyek itu, mulai dari `share_from`.
+  `project_id` di dalamnya diganti dengan id proyek tim.
+- Selama kunci proyek **perlu dirotasi** (ada anggota yang keluar), unggahan untuk proyek itu
+  ditahan sampai pengelola memasang versi baru. Datanya tetap aman di laptop.
 
 ### `service`
 

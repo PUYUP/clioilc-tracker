@@ -83,6 +83,9 @@ enum Commands {
     },
     /// List folders linked to team projects
     Links,
+    /// End-to-end team workspaces: your fingerprint, verify teammates who gave
+    /// you keys, then share linked folders now
+    Team,
     /// Stop sharing this folder with its team project
     Unlink {
         /// Folder to unlink (default: the current folder)
@@ -259,6 +262,7 @@ fn main() -> Result<()> {
             },
         ),
         Commands::Links => commands::link::links(&open_store(data_dir)?),
+        Commands::Team => commands::sync::Syncer::open(&open_store(data_dir)?)?.team(),
         Commands::Unlink { path } => commands::link::unlink(&open_store(data_dir)?, path),
         Commands::Sync => commands::sync::run(&open_store(data_dir)?),
         Commands::Service { command } => {

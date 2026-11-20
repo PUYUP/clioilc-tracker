@@ -23,6 +23,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Longest stored prompt, reply or thinking text, in characters.
@@ -109,6 +110,16 @@ CREATE TABLE IF NOT EXISTS private_tool_calls (
     synced_at TEXT
 );
 CREATE INDEX IF NOT EXISTS private_tool_calls_ts ON private_tool_calls(ts);
+
+-- local only: what team sync (E2E workspaces) already uploaded ---------
+CREATE TABLE IF NOT EXISTS team_sync (
+    project_pk  INTEGER NOT NULL,     -- team project id on the server
+    kind        TEXT NOT NULL,        -- tool_call, prompt, block
+    id          TEXT NOT NULL,
+    key_version INTEGER NOT NULL,
+    digest      TEXT NOT NULL,        -- sha256 of the uploaded plaintext
+    PRIMARY KEY (project_pk, kind, id)
+);
 ";
 
 /// Tables uploaded by sync, by tier.
@@ -520,6 +531,135 @@ impl UsageDb {
         Ok(rows)
     }
 
+    /// Private records of `project_id` for team sync, from `since` (RFC 3339)
+    /// on: tool actions, plus prompts and replies when `text` is true.
+    /// Records without a timestamp count only when there is no `since`.
+    pub fn team_candidates(
+        &self,
+        project_id: &str,
+        since: Option<&str>,
+        text: bool,
+    ) -> Result<Vec<TeamCandidate>> {
+        use serde_json::json;
+        let since = since.unwrap_or("");
+        let mut out = Vec::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.ts, p.full_name, p.summary, p.error
+             FROM private_tool_calls p
+             JOIN tool_calls t ON t.id = p.id
+             JOIN messages m ON m.id = t.message_id
+             WHERE m.project_id = ?1 AND (?2 = '' OR p.ts >= ?2)",
+        )?;
+        let rows = stmt.query_map(params![project_id, since], |r| {
+            Ok(TeamCandidate {
+                kind: "tool_call",
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                data: json!({
+                    "full_name": r.get::<_, Option<String>>(2)?,
+                    "summary": r.get::<_, Option<String>>(3)?,
+                    "error": r.get::<_, Option<String>>(4)?,
+                }),
+            })
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
+        if !text {
+            return Ok(out);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ts, session_id, is_subagent, text FROM private_prompts
+             WHERE project_id = ?1 AND (?2 = '' OR ts >= ?2)",
+        )?;
+        let rows = stmt.query_map(params![project_id, since], |r| {
+            Ok(TeamCandidate {
+                kind: "prompt",
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                // project_id is set by team sync to the team project's id.
+                data: json!({
+                    "session_id": r.get::<_, String>(2)?,
+                    "is_subagent": r.get::<_, bool>(3)?,
+                    "text": r.get::<_, String>(4)?,
+                }),
+            })
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT b.id, b.ts, b.message_id, b.kind, b.text
+             FROM private_blocks b JOIN messages m ON m.id = b.message_id
+             WHERE m.project_id = ?1 AND (?2 = '' OR b.ts >= ?2)",
+        )?;
+        let rows = stmt.query_map(params![project_id, since], |r| {
+            Ok(TeamCandidate {
+                kind: "block",
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                data: json!({
+                    "message_id": r.get::<_, String>(2)?,
+                    "kind": r.get::<_, String>(3)?,
+                    "text": r.get::<_, String>(4)?,
+                }),
+            })
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// What team sync already uploaded for a team project: (kind, id) ->
+    /// (key version, digest).
+    pub fn team_sent(&self, project_pk: u64) -> Result<HashMap<(String, String), (u64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT kind, id, key_version, digest FROM team_sync WHERE project_pk = ?1")?;
+        let rows = stmt.query_map([project_pk as i64], |r| {
+            Ok((
+                (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
+                (r.get::<_, i64>(2)? as u64, r.get::<_, String>(3)?),
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn team_mark(
+        &mut self,
+        project_pk: u64,
+        version: u64,
+        sent: &[(String, String, String)],
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO team_sync (project_pk, kind, id, key_version, digest)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (project_pk, kind, id)
+                 DO UPDATE SET key_version = excluded.key_version, digest = excluded.digest",
+            )?;
+            for (kind, id, digest) in sent {
+                stmt.execute(params![project_pk as i64, kind, id, version as i64, digest])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Forget uploads of these kinds (the server dropped them), so they are
+    /// sent again if sharing is turned back on.
+    pub fn team_forget(&mut self, project_pk: u64, kinds: &[&str]) -> Result<()> {
+        for kind in kinds {
+            self.conn.execute(
+                "DELETE FROM team_sync WHERE project_pk = ?1 AND kind = ?2",
+                params![project_pk as i64, kind],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Name of a known project, by `project_id`.
     pub fn project_name(&self, project_id: &str) -> Result<Option<String>> {
         Ok(self
@@ -680,6 +820,15 @@ pub struct SyncToolCall {
     pub message_id: Option<String>,
     pub name: Option<String>,
     pub status: Option<String>,
+}
+
+/// A record team sync may share (docs/e2e-teams.md, "Berbagi data").
+#[derive(Debug)]
+pub struct TeamCandidate {
+    pub kind: &'static str,
+    pub id: String,
+    pub ts: Option<String>,
+    pub data: serde_json::Value,
 }
 
 /// A private row: `kind` and `id` stay in clear, `data` gets encrypted
