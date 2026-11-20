@@ -410,7 +410,7 @@ fn read_passphrase(prompt: &str, new: bool) -> Result<String> {
     }
 }
 
-fn confirm(question: &str) -> Result<bool> {
+pub(crate) fn confirm(question: &str) -> Result<bool> {
     if !io::stdin().is_terminal() {
         bail!("{question} (pass --yes to confirm non-interactively)");
     }

@@ -34,6 +34,7 @@ cargo run -q --release -- watch --follow \
   - [`usage import` / `usage report`](#usage): token usage
   - [`activity`](#activity): apa yang dikerjakan agent hari ini
   - [`login` / `sync` / `logout`](#login--sync--logout): kirim data ke dashboard
+  - [`link` / `links` / `unlink`](#link--links--unlink): bagikan folder ke proyek tim
   - [`service`](#service): jalankan watcher otomatis di background
   - [`add mod`](#add-mod): buat reader baru
 - [Format output `--follow`](#format-output---follow)
@@ -293,6 +294,31 @@ setiap kali login tanpa membuka terminal, pakai [`service install`](#service).
 
 **`logout`** mencabut token mesin ini di server dan menghapus `auth.json`. Data lokal tetap
 disimpan.
+
+### `link` / `links` / `unlink`
+
+Membagikan data agent dari satu folder ke proyek tim (workspace) di dashboard. Workspace
+dan proyeknya dibuat dulu di dashboard. Detail aturannya ada di
+`backend/docs/workspaces.md`.
+
+```bash
+cd ~/code/acme-api
+./target/release/clioilc link acme/api        # folder ini -> proyek "api" di workspace "acme"
+./target/release/clioilc links                # daftar folder yang di-link
+./target/release/clioilc unlink               # berhenti membagikan folder ini
+```
+
+- **Yang dikirim hanya hash folder**, bukan nama atau path-nya. Link disimpan di server,
+  dan sync tidak berubah.
+- **Riwayat lama ditanya**, dengan default tidak dibagikan (hanya data sejak link).
+  `--history` atau `--no-history` untuk skrip.
+- **Subfolder** yang tercatat sebagai proyek tersendiri ditawarkan untuk ikut di-link
+  (`--subfolders` tanpa bertanya). Karena nama proyek Claude mengganti `/` dengan `-`,
+  folder saudara seperti `app-v2` juga ikut terdaftar, jadi periksa daftarnya.
+- **Yang dilihat tim:** token, biaya, error, dan aksi tool. Prompt, balasan, dan thinking
+  tetap pribadi, kecuali kamu menyalakan berbagi teks untuk proyek itu di dashboard.
+- Satu folder hanya bisa masuk ke satu proyek tim. Akun mode e2e belum bisa link.
+- `--path <folder>` untuk folder selain folder saat ini.
 
 ### `service`
 

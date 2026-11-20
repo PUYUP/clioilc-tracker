@@ -63,6 +63,31 @@ enum Commands {
     },
     /// Revoke this machine's token and forget the login (local data is kept)
     Logout,
+    /// Share this folder's agent data with a team project (workspace/project)
+    Link {
+        /// Team project, e.g. acme/api
+        target: String,
+        /// Folder to link (default: the current folder)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Also share the folder's history from before today
+        #[arg(long, conflicts_with = "no_history")]
+        history: bool,
+        /// Share only from now on (the default when not asked)
+        #[arg(long)]
+        no_history: bool,
+        /// Also link recorded subfolder projects without asking
+        #[arg(long)]
+        subfolders: bool,
+    },
+    /// List folders linked to team projects
+    Links,
+    /// Stop sharing this folder with its team project
+    Unlink {
+        /// Folder to unlink (default: the current folder)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
     /// Upload data not yet on the server
     Sync,
     /// Run `watch --sync` in the background at login (launchd / systemd --user)
@@ -211,6 +236,29 @@ fn main() -> Result<()> {
             },
         ),
         Commands::Logout => commands::login::logout(&open_store(data_dir)?),
+        Commands::Link {
+            target,
+            path,
+            history,
+            no_history,
+            subfolders,
+        } => commands::link::link(
+            &open_store(data_dir)?,
+            commands::link::Options {
+                target,
+                path,
+                history: if history {
+                    Some(true)
+                } else if no_history {
+                    Some(false)
+                } else {
+                    None
+                },
+                subfolders,
+            },
+        ),
+        Commands::Links => commands::link::links(&open_store(data_dir)?),
+        Commands::Unlink { path } => commands::link::unlink(&open_store(data_dir)?, path),
         Commands::Sync => commands::sync::run(&open_store(data_dir)?),
         Commands::Service { command } => {
             let store = open_store(data_dir)?;

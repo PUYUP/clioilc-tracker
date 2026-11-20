@@ -491,6 +491,47 @@ impl UsageDb {
         &self.salt
     }
 
+    /// `messages.project_id` of an agent project name (e.g. Claude's
+    /// `-Users-me-code-app`), whether or not it has data yet.
+    pub fn project_key(&self, name: &str) -> String {
+        self.hash("project", name)
+    }
+
+    /// Message count and first message time (RFC 3339) of a project.
+    pub fn project_activity(&self, project_id: &str) -> Result<(u64, Option<String>)> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*), MIN(ts) FROM messages WHERE project_id = ?1",
+            [project_id],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
+        )?)
+    }
+
+    /// Known projects whose name starts with `name-` (subfolders, or
+    /// siblings like `app-v2`: the name cannot tell them apart), as
+    /// (name, project_id), sorted by name.
+    pub fn projects_under(&self, name: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, project_id FROM private_projects
+             WHERE substr(name, 1, length(?1) + 1) = ?1 || '-' ORDER BY name",
+        )?;
+        let rows = stmt
+            .query_map([name], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Name of a known project, by `project_id`.
+    pub fn project_name(&self, project_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT name FROM private_projects WHERE project_id = ?1",
+                [project_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// True when no synced table has any row (a fresh database).
     pub fn is_empty(&self) -> Result<bool> {
         for table in PUBLIC_TABLES.iter().chain(PRIVATE_TABLES) {
@@ -1153,6 +1194,32 @@ mod tests {
         db.sync_finish(true, at(0)).unwrap();
         assert_eq!(pending(&db), 0);
         assert!(db.sync_claim(100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn project_lookup_for_link() {
+        let mut db = db();
+        for project in ["-Users-me-app", "-Users-me-app-api", "-Users-me-apple"] {
+            db.insert(
+                "claude",
+                Some(project),
+                &message(project, project, 5, "", &[]),
+            )
+            .unwrap();
+        }
+        db.commit().unwrap();
+        let key = db.project_key("-Users-me-app");
+        assert_eq!(db.project_activity(&key).unwrap().0, 1);
+        assert_eq!(
+            db.project_name(&key).unwrap().as_deref(),
+            Some("-Users-me-app")
+        );
+        let under: Vec<_> = db.projects_under("-Users-me-app").unwrap();
+        assert_eq!(under.len(), 1, "app-api, not apple");
+        assert_eq!(under[0].0, "-Users-me-app-api");
+        assert_eq!(under[0].1, db.project_key("-Users-me-app-api"));
+        let none = db.project_key("-Users-me-new");
+        assert_eq!(db.project_activity(&none).unwrap(), (0, None));
     }
 
     #[test]
