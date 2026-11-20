@@ -325,6 +325,9 @@ cd ~/code/acme-api
   mencocokkannya dengan git remote proyek tim yang boleh kamu link (diisi admin di
   dashboard). Pencocokan dilakukan di laptop: remote foldermu tidak dikirim ke server.
   Kalau cocok dengan satu proyek, kamu ditanya dulu sebelum di-link.
+  Di workspace E2E, remote proyek tersimpan terenkripsi; tracker membukanya dengan kunci
+  proyek yang sudah kamu verifikasi (lihat `clioilc team`), jadi pencocokan tetap terjadi di
+  laptop.
 
 ### `team` (workspace E2E)
 

@@ -271,6 +271,37 @@ pub fn sync(
     Ok(report)
 }
 
+/// Opened project keys by (project id, version).
+pub type ProjectKeys = HashMap<(u64, u64), [u8; KEY_LEN]>;
+
+/// Project keys of an E2E workspace I can use, by (project id, version):
+/// only grants that verify against my own key or a pinned teammate key.
+/// The notes say why a grant was not used.
+pub fn project_keys(
+    client: &Client,
+    dek: &[u8; KEY_LEN],
+    data_dir: &Path,
+    ws: &str,
+) -> Result<(ProjectKeys, Vec<String>)> {
+    let me = me(client)?;
+    let (ident, _) = identity(client, &me, dek)?;
+    let my_fp = ident.fingerprint()?;
+    let my_ed = ident.ed25519_public();
+    let pins = Pins::load(data_dir)?;
+    let state: KeyState = client.get(&format!("/api/v1/workspaces/{ws}/keys/"))?;
+    let mut keys = HashMap::new();
+    let mut notes = Vec::new();
+    for g in state.grants.iter().filter(|g| g.target == "project") {
+        match open_grant(&state, g, &pins, &me, &my_ed, &ident, &my_fp) {
+            Ok(key) => {
+                keys.insert((g.target_id, g.version), key);
+            }
+            Err(why) => notes.push(format!("{ws}: {why}")),
+        }
+    }
+    Ok((keys, notes))
+}
+
 fn open_grant(
     state: &KeyState,
     grant: &GrantRow,

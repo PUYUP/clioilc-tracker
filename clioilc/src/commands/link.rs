@@ -5,7 +5,9 @@
 use super::login::confirm;
 use crate::cloud::auth;
 use crate::cloud::client::{api_error_of, Client};
+use crate::cloud::{e2e, e2e_v2 as v2};
 use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use clioilc_core::{Store, UsageDb};
 use serde::Deserialize;
 use serde_json::json;
@@ -28,6 +30,15 @@ struct Linkable {
     project: String,
     name: String,
     git_remote: String,
+    #[serde(default)]
+    enc_mode: String,
+    #[serde(default)]
+    project_id: u64,
+    /// E2E: the remote sealed with the project key (decrypted here, never on the server).
+    #[serde(default)]
+    remote_ct: Option<String>,
+    #[serde(default)]
+    key_version: u64,
 }
 
 #[derive(Deserialize)]
@@ -125,7 +136,47 @@ fn folder_remote(dir: &Path) -> Option<String> {
 /// `clioilc link` without a target: the one linkable project whose git
 /// remote matches the folder's. Matching happens here; the folder's remote
 /// is never sent to the server.
-fn find_target(client: &Client, dir: &Path) -> Result<String> {
+/// E2E workspaces seal their projects' remotes: open them with the project
+/// keys this machine can verify. Returns why some stayed sealed.
+fn open_e2e_remotes(
+    projects: &mut [Linkable],
+    store: &Store,
+    client: &Client,
+) -> Result<Vec<String>> {
+    let sealed: std::collections::BTreeSet<String> = projects
+        .iter()
+        .filter(|p| p.enc_mode == "e2e" && p.remote_ct.is_some())
+        .map(|p| p.workspace.clone())
+        .collect();
+    if sealed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let auth = auth::require(store.data_dir())?;
+    let Some(dek) = auth.data_key.as_deref() else {
+        return Ok(vec![
+            "end-to-end workspaces need an end-to-end account".into()
+        ]);
+    };
+    let dek = e2e::to_key(&B64.decode(dek)?)?;
+    let mut notes = Vec::new();
+    for ws in sealed {
+        let (keys, why) = super::team::project_keys(client, &dek, store.data_dir(), &ws)?;
+        notes.extend(why);
+        for p in projects.iter_mut().filter(|p| p.workspace == ws) {
+            let (Some(ct), Some(key)) = (&p.remote_ct, keys.get(&(p.project_id, p.key_version)))
+            else {
+                continue;
+            };
+            let ctx = v2::ctx_project_remote(p.project_id, p.key_version);
+            if let Ok(plain) = e2e::open(key, &B64.decode(ct)?, &ctx) {
+                p.git_remote = String::from_utf8_lossy(&plain).into_owned();
+            }
+        }
+    }
+    Ok(notes)
+}
+
+fn find_target(client: &Client, dir: &Path, store: &Store) -> Result<String> {
     let raw = folder_remote(dir).with_context(|| {
         format!(
             "{} has no git remote; run `clioilc link <workspace>/<project>`",
@@ -134,7 +185,11 @@ fn find_target(client: &Client, dir: &Path) -> Result<String> {
     })?;
     let remote =
         normalize_remote(&raw).with_context(|| format!("cannot read git remote {raw:?}"))?;
-    let projects: Vec<Linkable> = client.get("/api/v1/workspaces/linkable/")?;
+    let mut projects: Vec<Linkable> = client.get("/api/v1/workspaces/linkable/")?;
+    let notes = open_e2e_remotes(&mut projects, store, client)?;
+    for p in projects.iter_mut().filter(|p| p.name.is_empty()) {
+        p.name = p.project.clone(); // E2E names are sealed; the slug stands in
+    }
     let matches: Vec<&Linkable> = projects.iter().filter(|p| p.git_remote == remote).collect();
     match matches.as_slice() {
         [one] => {
@@ -153,6 +208,9 @@ fn find_target(client: &Client, dir: &Path) -> Result<String> {
         }
         [] => {
             let mut msg = format!("no team project you can link to has the git remote {remote}");
+            for note in &notes {
+                msg.push_str(&format!("\n  ({note})"));
+            }
             if projects.is_empty() {
                 msg.push_str("\n(you cannot link to any project yet: ask for an invitation)");
             } else {
@@ -205,7 +263,7 @@ pub fn link(store: &Store, opts: Options) -> Result<()> {
     let (dir, name) = folder(opts.path)?;
     let target = match opts.target {
         Some(t) => t,
-        None => find_target(&client, &dir)?,
+        None => find_target(&client, &dir, store)?,
     };
     let (ws, project) = split_target(&target)?;
     let key = db.project_key(&name);
