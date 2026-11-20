@@ -65,8 +65,9 @@ enum Commands {
     Logout,
     /// Share this folder's agent data with a team project (workspace/project)
     Link {
-        /// Team project, e.g. acme/api
-        target: String,
+        /// Team project, e.g. acme/api (default: the project whose git remote
+        /// matches this folder's, matched locally)
+        target: Option<String>,
         /// Folder to link (default: the current folder)
         #[arg(long)]
         path: Option<PathBuf>,
