@@ -65,6 +65,11 @@ enum Commands {
     Logout,
     /// Upload data not yet on the server
     Sync,
+    /// Run `watch --sync` in the background at login (launchd / systemd --user)
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommands,
+    },
     /// What the agent did on a day: prompts, replies, tool actions (private)
     Activity {
         /// Day to show, YYYY-MM-DD in local time (default: today)
@@ -123,6 +128,16 @@ enum UsageCommands {
         #[arg(long, value_enum, default_value_t = commands::usage::By::Model)]
         by: commands::usage::By,
     },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommands {
+    /// Install and start the background watcher (requires `clioilc login`)
+    Install,
+    /// Stop and remove the background watcher
+    Uninstall,
+    /// Show whether the background watcher is running, and its last log lines
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -197,6 +212,14 @@ fn main() -> Result<()> {
         ),
         Commands::Logout => commands::login::logout(&open_store(data_dir)?),
         Commands::Sync => commands::sync::run(&open_store(data_dir)?),
+        Commands::Service { command } => {
+            let store = open_store(data_dir)?;
+            match command {
+                ServiceCommands::Install => commands::service::install(&store),
+                ServiceCommands::Uninstall => commands::service::uninstall(&store),
+                ServiceCommands::Status => commands::service::status(&store),
+            }
+        }
         Commands::Activity {
             date,
             project,

@@ -34,6 +34,7 @@ cargo run -q --release -- watch --follow \
   - [`usage import` / `usage report`](#usage): token usage
   - [`activity`](#activity): apa yang dikerjakan agent hari ini
   - [`login` / `sync` / `logout`](#login--sync--logout): kirim data ke dashboard
+  - [`service`](#service): jalankan watcher otomatis di background
   - [`add mod`](#add-mod): buat reader baru
 - [Format output `--follow`](#format-output---follow)
 - [Contoh pipeline](#contoh-pipeline)
@@ -287,10 +288,42 @@ Untuk skrip atau CI, passphrase bisa diberikan lewat `CLIOILC_PASSPHRASE`.
   dan meminta `login` ulang.
 
 **`watch --sync`** menjalankan sync di background. Interval default 30 detik, bisa diatur
-dengan `--sync-every <detik>`. Error yang sama hanya dicetak sekali.
+dengan `--sync-every <detik>`. Error yang sama hanya dicetak sekali. Supaya jalan otomatis
+setiap kali login tanpa membuka terminal, pakai [`service install`](#service).
 
 **`logout`** mencabut token mesin ini di server dan menghapus `auth.json`. Data lokal tetap
 disimpan.
+
+### `service`
+
+Menjalankan `clioilc watch --sync` di background secara otomatis setiap kali login ke komputer,
+dan menyalakannya lagi kalau berhenti. Di macOS memakai LaunchAgent (`launchd`), di Linux
+memakai unit `systemd --user`.
+
+```sh
+./target/release/clioilc login --server https://api.example.com   # wajib dulu
+./target/release/clioilc service install     # pasang dan langsung jalan
+./target/release/clioilc service status      # running / not installed, plus 5 baris log terakhir
+./target/release/clioilc service uninstall   # hentikan dan hapus
+```
+
+| | macOS | Linux |
+|---|---|---|
+| File | `~/Library/LaunchAgents/com.clioilc.watch.plist` | `~/.config/systemd/user/com.clioilc.watch.service` |
+| Restart kalau berhenti | `KeepAlive`, jeda 30 detik | `Restart=always`, jeda 30 detik |
+| Log | `<data dir>/watch.log` | `<data dir>/watch.log` |
+
+Catatan:
+
+- `install` menolak jalan kalau belum `login`. Tanpa login, watcher akan langsung berhenti dan
+  terus dinyalakan ulang.
+- Service menjalankan **binary yang dipakai saat `install`** (path absolut) dengan `--data-dir`
+  yang sama. Kalau binary dipindah, jalankan `install` lagi.
+- Hentikan dulu `clioilc watch` yang kamu jalankan manual, supaya tidak ada dua watcher sekaligus.
+  Dua watcher tidak membuat data dobel, tapi bekerja dua kali.
+- Saat service dihentikan (SIGTERM dari launchd/systemd), watcher berhenti dengan rapi seperti
+  Ctrl+C: posisi baca tersimpan.
+- `CLIOILC_SERVICE_LABEL` mengganti nama service, misalnya untuk akun atau data dir kedua.
 
 ### `add mod`
 
@@ -543,6 +576,7 @@ Semua ada di `--data-dir` (default `~/.clioilc`):
 | `usage.db` | Token usage dan timeline aktivitas (SQLite), lihat [Database dan privasi](#database-dan-privasi) |
 | `auth.json` | Hasil `login`: server, token perangkat, mode enkripsi, dan (mode e2e) data key. Permission 0600 |
 | `sync.lock` | Mencegah dua `sync` berjalan bersamaan |
+| `watch.log` | Output watcher yang dijalankan oleh `service install` (sync, error) |
 | `usage.db.before-login-*` | Backup saat `login` membangun ulang `usage.db` dengan salt akun |
 
 ## Perilaku dan batasan
