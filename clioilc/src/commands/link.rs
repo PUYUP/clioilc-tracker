@@ -259,9 +259,12 @@ pub fn link(store: &Store, opts: Options) -> Result<()> {
                     "skipped {label}: already linked to another project (`clioilc unlink` first)"
                 ),
                 Some("forbidden") => bail!("your role in {ws}/{project} cannot link folders"),
-                Some("e2e_not_supported_yet") => {
-                    bail!("end-to-end accounts cannot share with a team yet")
-                }
+                Some("e2e_workspace_required") => bail!(
+                    "{ws} is not an end-to-end workspace; end-to-end accounts share only in end-to-end workspaces"
+                ),
+                Some("e2e_account_required") => bail!(
+                    "{ws} is an end-to-end workspace; it accepts end-to-end accounts only"
+                ),
                 _ => return Err(err),
             },
         }
