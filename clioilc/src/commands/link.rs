@@ -160,10 +160,12 @@ fn find_target(client: &Client, dir: &Path) -> Result<String> {
                     "\nprojects you can link to (set a project's git remote in the dashboard):",
                 );
                 for p in &projects {
-                    msg.push_str(&format!(
-                        "\n  {}/{}  {}",
-                        p.workspace, p.project, p.git_remote
-                    ));
+                    let remote = if p.git_remote.is_empty() {
+                        "(no git remote)"
+                    } else {
+                        &p.git_remote
+                    };
+                    msg.push_str(&format!("\n  {}/{}  {remote}", p.workspace, p.project));
                 }
             }
             bail!(msg)

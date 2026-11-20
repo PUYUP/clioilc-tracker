@@ -319,6 +319,10 @@ cd ~/code/acme-api
   tetap pribadi, kecuali kamu menyalakan berbagi teks untuk proyek itu di dashboard.
 - Satu folder hanya bisa masuk ke satu proyek tim. Akun mode e2e belum bisa link.
 - `--path <folder>` untuk folder selain folder saat ini.
+- **Tanpa target** (`clioilc link` saja), tracker membaca git remote folder ini lalu
+  mencocokkannya dengan git remote proyek tim yang boleh kamu link (diisi admin di
+  dashboard). Pencocokan dilakukan di laptop: remote foldermu tidak dikirim ke server.
+  Kalau cocok dengan satu proyek, kamu ditanya dulu sebelum di-link.
 
 ### `service`
 
