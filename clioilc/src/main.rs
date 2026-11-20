@@ -43,7 +43,7 @@ enum Commands {
     },
     /// Connect this machine to your clioilc account (approve in the browser)
     Login {
-        /// Backend URL, e.g. https://api.example.com (default: $CLIOILC_SERVER
+        /// Backend URL, e.g. https://api.clioilc.com (default: $CLIOILC_SERVER
         /// or the server of the previous login)
         #[arg(long)]
         server: Option<String>,

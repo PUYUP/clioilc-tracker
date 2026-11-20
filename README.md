@@ -242,7 +242,7 @@ yang belum terkirim. Kontrak lengkapnya ada di repo backend: `docs/sync.md` (pay
 protokol), `docs/auth.md` (device flow), dan `docs/encryption.md` (format e2e).
 
 ```sh
-./target/release/clioilc login --server https://api.example.com   # sekali per mesin
+./target/release/clioilc login --server https://api.clioilc.com   # sekali per mesin
 ./target/release/clioilc sync                                      # upload yang belum terkirim
 ./target/release/clioilc watch --sync                              # rekam + sync tiap 30 detik
 ./target/release/clioilc logout                                    # cabut token mesin ini
@@ -301,7 +301,7 @@ dan menyalakannya lagi kalau berhenti. Di macOS memakai LaunchAgent (`launchd`),
 memakai unit `systemd --user`.
 
 ```sh
-./target/release/clioilc login --server https://api.example.com   # wajib dulu
+./target/release/clioilc login --server https://api.clioilc.com   # wajib dulu
 ./target/release/clioilc service install     # pasang dan langsung jalan
 ./target/release/clioilc service status      # running / not installed, plus 5 baris log terakhir
 ./target/release/clioilc service uninstall   # hentikan dan hapus
