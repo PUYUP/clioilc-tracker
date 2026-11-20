@@ -159,8 +159,22 @@ pub fn identity(client: &Client, me: &Me, dek: &[u8; KEY_LEN]) -> Result<(Identi
                 "ed25519_pk": B64.encode(id.ed25519_public()),
                 "wrapped_secret": B64.encode(e2e::seal(dek, &id.secret(), &v2::ctx_identity(me.id))?),
             });
-            let _: Value = client.put("/api/v1/users/identity/", &body)?;
-            Ok((id, true))
+            match client.put::<Value>("/api/v1/users/identity/", &body) {
+                Ok(_) => Ok((id, true)),
+                // Another client (the browser, another machine) made one
+                // meanwhile: use that one, never replace it silently.
+                Err(err)
+                    if api_error_of(&err)
+                        .is_some_and(|e| e.error.as_deref() == Some("identity_exists")) =>
+                {
+                    let row: IdentityRow = client.get("/api/v1/users/identity/")?;
+                    let wrapped = B64.decode(row.wrapped_secret.as_deref().unwrap_or_default())?;
+                    let secret = e2e::open(dek, &wrapped, &v2::ctx_identity(me.id))
+                        .context("cannot open your identity with this machine's key")?;
+                    Ok((Identity::from_secret(&secret)?, false))
+                }
+                Err(err) => Err(err),
+            }
         }
         Err(err) => Err(err),
     }
