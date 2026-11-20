@@ -158,11 +158,19 @@ impl Syncer {
 
     fn private_row(&self, p: &clioilc_core::usage_db::SyncPrivate) -> Result<Value> {
         Ok(match &self.data_key {
-            None => json!({ "kind": p.kind, "id": p.id, "ts": p.ts, "data": p.data }),
+            None => json!({
+                "kind": p.kind, "id": p.id, "ts": p.ts, "project_id": p.project_id, "data": p.data,
+            }),
             Some(key) => {
                 let plain = serde_json::to_vec(&p.data)?;
                 let blob = e2e::seal(key, &plain, &e2e::record_aad(p.kind, &p.id))?;
-                json!({ "kind": p.kind, "id": p.id, "ts": p.ts, "ciphertext": B64.encode(blob) })
+                json!({
+                    "kind": p.kind,
+                    "id": p.id,
+                    "ts": p.ts,
+                    "project_id": p.project_id,
+                    "ciphertext": B64.encode(blob),
+                })
             }
         })
     }

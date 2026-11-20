@@ -649,6 +649,10 @@ pub struct SyncPrivate {
     pub kind: &'static str,
     pub id: String,
     pub ts: Option<String>,
+    /// The record's project (same hash as `messages.project_id`), sent in
+    /// clear so the server can scope records to a project without opening
+    /// them. None when the message it belongs to is not known locally.
+    pub project_id: Option<String>,
     pub data: serde_json::Value,
 }
 
@@ -699,28 +703,35 @@ fn read_claimed(conn: &Connection) -> Result<SyncBatch> {
         .collect::<rusqlite::Result<_>>()?;
 
     let mut push = |sql: &str, f: &dyn Fn(&rusqlite::Row) -> rusqlite::Result<SyncPrivate>| {
-        let mut stmt = conn.prepare(&format!("{sql} {claimed}"))?;
+        // `sql` names the private table `p`; joined tables have synced_at too.
+        let mut stmt = conn.prepare(&format!("{sql} WHERE p.synced_at = '{SENDING}'"))?;
         let rows = stmt.query_map([], |r| f(r))?;
         for row in rows {
             batch.private.push(row?);
         }
         anyhow::Ok(())
     };
-    push("SELECT project_id, name FROM private_projects", &|r| {
-        Ok(SyncPrivate {
-            kind: "project",
-            id: r.get(0)?,
-            ts: None,
-            data: json!({ "name": r.get::<_, String>(1)? }),
-        })
-    })?;
     push(
-        "SELECT id, ts, project_id, session_id, is_subagent, text FROM private_prompts",
+        "SELECT p.project_id, p.name FROM private_projects p",
+        &|r| {
+            Ok(SyncPrivate {
+                kind: "project",
+                id: r.get(0)?,
+                ts: None,
+                project_id: Some(r.get(0)?),
+                data: json!({ "name": r.get::<_, String>(1)? }),
+            })
+        },
+    )?;
+    push(
+        "SELECT p.id, p.ts, p.project_id, p.session_id, p.is_subagent, p.text
+         FROM private_prompts p",
         &|r| {
             Ok(SyncPrivate {
                 kind: "prompt",
                 id: r.get(0)?,
                 ts: r.get(1)?,
+                project_id: Some(r.get(2)?),
                 data: json!({
                     "project_id": r.get::<_, String>(2)?,
                     "session_id": r.get::<_, String>(3)?,
@@ -731,12 +742,14 @@ fn read_claimed(conn: &Connection) -> Result<SyncBatch> {
         },
     )?;
     push(
-        "SELECT id, ts, message_id, kind, text FROM private_blocks",
+        "SELECT p.id, p.ts, p.message_id, p.kind, p.text, m.project_id
+         FROM private_blocks p LEFT JOIN messages m ON m.id = p.message_id",
         &|r| {
             Ok(SyncPrivate {
                 kind: "block",
                 id: r.get(0)?,
                 ts: r.get(1)?,
+                project_id: r.get(5)?,
                 data: json!({
                     "message_id": r.get::<_, String>(2)?,
                     "kind": r.get::<_, String>(3)?,
@@ -746,12 +759,16 @@ fn read_claimed(conn: &Connection) -> Result<SyncBatch> {
         },
     )?;
     push(
-        "SELECT id, ts, full_name, summary, error FROM private_tool_calls",
+        "SELECT p.id, p.ts, p.full_name, p.summary, p.error, m.project_id
+         FROM private_tool_calls p
+         LEFT JOIN tool_calls t ON t.id = p.id
+         LEFT JOIN messages m ON m.id = t.message_id",
         &|r| {
             Ok(SyncPrivate {
                 kind: "tool_call",
                 id: r.get(0)?,
                 ts: r.get(1)?,
+                project_id: r.get(5)?,
                 data: json!({
                     "full_name": r.get::<_, Option<String>>(2)?,
                     "summary": r.get::<_, Option<String>>(3)?,
@@ -1122,6 +1139,17 @@ mod tests {
         let project = rest.private.iter().find(|p| p.kind == "project").unwrap();
         assert_eq!(project.data["name"], "app");
         assert!(project.ts.is_none());
+        // Every private row names its project, even after its message was
+        // already sent in an earlier batch.
+        let project_id = first.messages[0].project_id.clone();
+        for p in &rest.private {
+            assert_eq!(
+                p.project_id.as_deref(),
+                Some(project_id.as_str()),
+                "{}",
+                p.kind
+            );
+        }
         db.sync_finish(true, at(0)).unwrap();
         assert_eq!(pending(&db), 0);
         assert!(db.sync_claim(100).unwrap().is_empty());
