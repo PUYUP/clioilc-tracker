@@ -56,7 +56,10 @@ CREATE TABLE IF NOT EXISTS messages (
     cache_write_tokens INTEGER NOT NULL,
     cache_read_tokens  INTEGER NOT NULL,
     output_tokens      INTEGER NOT NULL,
-    synced_at          TEXT
+    synced_at          TEXT,
+    cache_write_5m_tokens INTEGER,         -- split of cache_write_tokens, if known
+    cache_write_1h_tokens INTEGER,
+    speed              TEXT               -- 'standard', 'fast', ... if known
 );
 CREATE INDEX IF NOT EXISTS messages_unsynced ON messages(synced_at) WHERE synced_at IS NULL;
 CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
@@ -119,18 +122,33 @@ pub const PRIVATE_TABLES: &[&str] = &[
 
 const UPSERT_MESSAGE: &str = "
 INSERT INTO messages (id, tool, project_id, session_id, is_subagent, ts, model, status,
-                      input_tokens, cache_write_tokens, cache_read_tokens, output_tokens)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                      input_tokens, cache_write_tokens, cache_read_tokens, output_tokens,
+                      cache_write_5m_tokens, cache_write_1h_tokens, speed)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
 ON CONFLICT(id) DO UPDATE SET
     input_tokens       = max(input_tokens, excluded.input_tokens),
     cache_write_tokens = max(cache_write_tokens, excluded.cache_write_tokens),
     cache_read_tokens  = max(cache_read_tokens, excluded.cache_read_tokens),
     output_tokens      = max(output_tokens, excluded.output_tokens),
+    -- The split must describe the cache_write_tokens kept above.
+    cache_write_5m_tokens = CASE
+        WHEN excluded.cache_write_5m_tokens IS NOT NULL
+         AND excluded.cache_write_tokens >= messages.cache_write_tokens
+        THEN excluded.cache_write_5m_tokens ELSE messages.cache_write_5m_tokens END,
+    cache_write_1h_tokens = CASE
+        WHEN excluded.cache_write_1h_tokens IS NOT NULL
+         AND excluded.cache_write_tokens >= messages.cache_write_tokens
+        THEN excluded.cache_write_1h_tokens ELSE messages.cache_write_1h_tokens END,
+    speed              = coalesce(excluded.speed, messages.speed),
     synced_at          = NULL
 WHERE excluded.input_tokens       > messages.input_tokens
    OR excluded.cache_write_tokens > messages.cache_write_tokens
    OR excluded.cache_read_tokens  > messages.cache_read_tokens
-   OR excluded.output_tokens      > messages.output_tokens";
+   OR excluded.output_tokens      > messages.output_tokens
+   -- Backfill details older rows lack (re-run `usage import`).
+   OR (messages.cache_write_5m_tokens IS NULL AND excluded.cache_write_5m_tokens IS NOT NULL
+       AND excluded.cache_write_tokens >= messages.cache_write_tokens)
+   OR (messages.speed IS NULL AND excluded.speed IS NOT NULL)";
 
 const UPSERT_TOOL_CALL: &str = "
 INSERT INTO tool_calls (id, message_id, name) VALUES (?1, ?2, ?3)
@@ -244,6 +262,7 @@ impl UsageDb {
         conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.execute_batch(SCHEMA)
             .context("creating usage schema")?;
+        migrate(&conn).context("upgrading usage schema")?;
         let salt = load_or_create_salt(&conn)?;
         Ok(Self {
             conn,
@@ -295,6 +314,9 @@ impl UsageDb {
             to_i64(m.usage.cache_write),
             to_i64(m.usage.cache_read),
             to_i64(m.usage.output),
+            m.usage.cache_write_5m.map(to_i64),
+            m.usage.cache_write_1h.map(to_i64),
+            m.speed.as_deref().map(|s| label(s, "unknown")),
         ])?;
 
         let ts = private_ts(m.timestamp);
@@ -412,6 +434,7 @@ impl UsageDb {
                     cache_write: n(4)?,
                     cache_read: n(5)?,
                     output: n(6)?,
+                    ..Usage::default()
                 },
                 tool_calls: n(7)?,
                 tool_errors: n(8)?,
@@ -604,6 +627,10 @@ pub struct SyncMessage {
     pub cache_write_tokens: i64,
     pub cache_read_tokens: i64,
     pub output_tokens: i64,
+    pub cache_write_5m_tokens: Option<i64>,
+    pub cache_write_1h_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -632,7 +659,8 @@ fn read_claimed(conn: &Connection) -> Result<SyncBatch> {
 
     let mut stmt = conn.prepare(&format!(
         "SELECT id, tool, project_id, session_id, is_subagent, ts, model, status, input_tokens,
-                cache_write_tokens, cache_read_tokens, output_tokens FROM messages {claimed}"
+                cache_write_tokens, cache_read_tokens, output_tokens,
+                cache_write_5m_tokens, cache_write_1h_tokens, speed FROM messages {claimed}"
     ))?;
     batch.messages = stmt
         .query_map([], |r| {
@@ -649,6 +677,9 @@ fn read_claimed(conn: &Connection) -> Result<SyncBatch> {
                 cache_write_tokens: r.get(9)?,
                 cache_read_tokens: r.get(10)?,
                 output_tokens: r.get(11)?,
+                cache_write_5m_tokens: r.get(12)?,
+                cache_write_1h_tokens: r.get(13)?,
+                speed: r.get(14)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -730,6 +761,27 @@ fn read_claimed(conn: &Connection) -> Result<SyncBatch> {
         },
     )?;
     Ok(batch)
+}
+
+/// Columns added after the first release, for databases created before.
+const MIGRATIONS: &[(&str, &str, &str)] = &[
+    ("messages", "cache_write_5m_tokens", "INTEGER"),
+    ("messages", "cache_write_1h_tokens", "INTEGER"),
+    ("messages", "speed", "TEXT"),
+];
+
+fn migrate(conn: &Connection) -> Result<()> {
+    for (table, column, kind) in MIGRATIONS {
+        let exists: bool = conn.query_row(
+            &format!("SELECT EXISTS (SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"),
+            [column],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn private_ts(ts: DateTime<Utc>) -> String {
@@ -829,7 +881,9 @@ mod tests {
                 cache_write: 10,
                 cache_read: 100,
                 output,
+                ..Usage::default()
             },
+            speed: None,
             blocks: if text.is_empty() {
                 vec![]
             } else {
@@ -1142,5 +1196,104 @@ mod tests {
         b.replace_salt(&salt).unwrap();
         assert_eq!(a.hash("project", "app"), b.hash("project", "app"));
         a.commit().unwrap();
+    }
+
+    fn with_split(id: &str, output: u64, split: Option<(u64, u64)>, speed: Option<&str>) -> Record {
+        let Record::Message(mut m) = message(id, "l1", output, "", &[]) else {
+            unreachable!()
+        };
+        if let Some((a, b)) = split {
+            m.usage.cache_write_5m = Some(a);
+            m.usage.cache_write_1h = Some(b);
+        }
+        m.speed = speed.map(str::to_string);
+        Record::Message(m)
+    }
+
+    #[test]
+    fn old_databases_get_the_new_columns() {
+        let path =
+            std::env::temp_dir().join(format!("clioilc-usage-old-{}.db", std::process::id()));
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages (id TEXT PRIMARY KEY, tool TEXT NOT NULL, project_id TEXT NOT NULL,
+                 session_id TEXT NOT NULL, is_subagent INTEGER NOT NULL, ts TEXT NOT NULL, model TEXT NOT NULL,
+                 status TEXT NOT NULL, input_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL,
+                 cache_read_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, synced_at TEXT);",
+            )
+            .unwrap();
+        }
+        let mut db = UsageDb::open(&path).unwrap();
+        db.insert(
+            "claude",
+            None,
+            &with_split("m", 5, Some((4, 6)), Some("fast")),
+        )
+        .unwrap();
+        db.commit().unwrap();
+        let m = &db.sync_claim(10).unwrap().messages[0];
+        assert_eq!(
+            (m.cache_write_5m_tokens, m.cache_write_1h_tokens),
+            (Some(4), Some(6))
+        );
+        assert_eq!(m.speed.as_deref(), Some("fast"));
+        // Opening again doesn't try to add the columns twice.
+        drop(db);
+        UsageDb::open(&path).unwrap();
+    }
+
+    #[test]
+    fn reimport_backfills_split_and_speed_and_resyncs() {
+        let mut db = db();
+        db.insert("claude", None, &with_split("m", 5, None, None))
+            .unwrap();
+        db.commit().unwrap();
+        db.sync_claim(100).unwrap();
+        db.sync_finish(true, at(0)).unwrap();
+        assert_eq!(pending(&db), 0);
+
+        // Same message, now read by a reader that knows the split.
+        db.insert(
+            "claude",
+            None,
+            &with_split("m", 5, Some((3, 7)), Some("standard")),
+        )
+        .unwrap();
+        db.commit().unwrap();
+        let batch = db.sync_claim(100).unwrap();
+        assert_eq!(batch.messages.len(), 1, "changed row is sent again");
+        let m = &batch.messages[0];
+        assert_eq!(
+            (m.cache_write_5m_tokens, m.cache_write_1h_tokens),
+            (Some(3), Some(7))
+        );
+        assert_eq!(m.speed.as_deref(), Some("standard"));
+        db.sync_finish(true, at(0)).unwrap();
+
+        // Identical line again: nothing to resend.
+        db.insert(
+            "claude",
+            None,
+            &with_split("m", 5, Some((3, 7)), Some("standard")),
+        )
+        .unwrap();
+        db.commit().unwrap();
+        assert!(db.sync_claim(100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sync_json_omits_unknown_speed() {
+        let mut db = db();
+        db.insert("claude", None, &with_split("m", 5, None, None))
+            .unwrap();
+        db.commit().unwrap();
+        let json = serde_json::to_value(db.sync_claim(10).unwrap()).unwrap();
+        let m = &json["messages"][0];
+        assert!(m.get("speed").is_none());
+        assert!(m["cache_write_5m_tokens"].is_null());
     }
 }

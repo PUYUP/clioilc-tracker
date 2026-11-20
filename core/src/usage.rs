@@ -34,6 +34,8 @@ pub struct Message {
     pub model: String,
     pub status: Status,
     pub usage: Usage,
+    /// Service speed label, e.g. `standard` or `fast` (priced higher).
+    pub speed: Option<String>,
     /// Private: visible text and thinking on this line.
     pub blocks: Vec<TextBlock>,
     /// Tool calls requested on this line.
@@ -46,6 +48,10 @@ pub struct Usage {
     pub cache_write: u64,
     pub cache_read: u64,
     pub output: u64,
+    /// `cache_write` split by cache duration (priced differently), when the
+    /// log has it. Readers only set it when the two add up to `cache_write`.
+    pub cache_write_5m: Option<u64>,
+    pub cache_write_1h: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

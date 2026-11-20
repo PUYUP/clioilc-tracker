@@ -47,7 +47,7 @@ enum Commands {
         /// or the server of the previous login)
         #[arg(long)]
         server: Option<String>,
-        /// Device name shown in the dashboard (default: hostname)
+        /// Device name shown in the dashboard (default: the Computer Name on macOS, else the hostname)
         #[arg(long)]
         name: Option<String>,
         /// How private data is encrypted, asked on the account's first login.

@@ -106,6 +106,16 @@ struct LineUsage {
     cache_read_input_tokens: u64,
     #[serde(default)]
     output_tokens: u64,
+    cache_creation: Option<CacheCreation>,
+    speed: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CacheCreation {
+    #[serde(default)]
+    ephemeral_5m_input_tokens: u64,
+    #[serde(default)]
+    ephemeral_1h_input_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -160,12 +170,26 @@ impl Line {
                 let (Some(id), Some(line_id)) = (msg.id, self.uuid) else {
                     return Vec::new();
                 };
-                let usage = msg.usage.map_or_else(Usage::default, |u| Usage {
-                    input: u.input_tokens,
-                    cache_write: u.cache_creation_input_tokens,
-                    cache_read: u.cache_read_input_tokens,
-                    output: u.output_tokens,
-                });
+                let (usage, speed) = msg.usage.map_or_else(
+                    || (Usage::default(), None),
+                    |u| {
+                        // Keep the split only when it adds up; a partial one
+                        // would misprice the cache writes.
+                        let split = u.cache_creation.filter(|c| {
+                            c.ephemeral_5m_input_tokens + c.ephemeral_1h_input_tokens
+                                == u.cache_creation_input_tokens
+                        });
+                        let usage = Usage {
+                            input: u.input_tokens,
+                            cache_write: u.cache_creation_input_tokens,
+                            cache_read: u.cache_read_input_tokens,
+                            output: u.output_tokens,
+                            cache_write_5m: split.as_ref().map(|c| c.ephemeral_5m_input_tokens),
+                            cache_write_1h: split.as_ref().map(|c| c.ephemeral_1h_input_tokens),
+                        };
+                        (usage, u.speed)
+                    },
+                );
                 let status = if self.is_api_error_message {
                     Status::Error(self.error.unwrap_or_else(|| "api_error".into()))
                 } else {
@@ -200,6 +224,7 @@ impl Line {
                     model: msg.model.unwrap_or_else(|| "unknown".into()),
                     status,
                     usage,
+                    speed,
                     blocks,
                     tool_calls,
                 })]
@@ -461,6 +486,32 @@ mod tests {
 
     fn parse(line: &str) -> Vec<Record> {
         ClaudeReader.parse_line(line.as_bytes())
+    }
+
+    #[test]
+    fn reads_cache_split_and_speed() {
+        let line = r#"{"type":"assistant","uuid":"l","sessionId":"s","timestamp":"2026-11-20T01:00:00Z","message":{"id":"m","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":5,"output_tokens":7,"cache_creation":{"ephemeral_5m_input_tokens":30,"ephemeral_1h_input_tokens":70},"speed":"fast"}}}"#;
+        let m = one_message(line);
+        assert_eq!(
+            (m.usage.cache_write_5m, m.usage.cache_write_1h),
+            (Some(30), Some(70))
+        );
+        assert_eq!(m.speed.as_deref(), Some("fast"));
+
+        // A split that doesn't add up is dropped rather than misprice writes.
+        let bad = line.replace(
+            "\"ephemeral_1h_input_tokens\":70",
+            "\"ephemeral_1h_input_tokens\":71",
+        );
+        let m = one_message(&bad);
+        assert_eq!(
+            (m.usage.cache_write_5m, m.usage.cache_write_1h),
+            (None, None)
+        );
+
+        let plain = line.replace(r#","cache_creation":{"ephemeral_5m_input_tokens":30,"ephemeral_1h_input_tokens":70},"speed":"fast""#, "");
+        let m = one_message(&plain);
+        assert_eq!((m.usage.cache_write_5m, m.speed), (None, None));
     }
 
     fn one_message(line: &str) -> Message {

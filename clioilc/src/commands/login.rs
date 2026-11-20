@@ -84,9 +84,7 @@ pub fn login(store: &Store, opts: Options) -> Result<()> {
         .or_else(|| std::env::var(SERVER_ENV).ok().filter(|s| !s.is_empty()))
         .or_else(|| saved.as_ref().map(|a| a.server.clone()))
         .context("which server? pass --server <url> (or set CLIOILC_SERVER)")?;
-    let name = opts
-        .name
-        .unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned());
+    let name = opts.name.unwrap_or_else(default_device_name);
 
     let anon = Client::new(&server, None)?;
     let start: Start = anon.post("/api/v1/devices/authorize/", &json!({ "name": name }))?;
@@ -163,6 +161,31 @@ pub fn logout(store: &Store) -> Result<()> {
     auth::remove(data_dir)?;
     eprintln!("logged out; local data in {} is kept", data_dir.display());
     Ok(())
+}
+
+/// What the dashboard calls this machine when `--name` is not given. On
+/// macOS the hostname is often just an IP (e.g. on DHCP), so prefer the
+/// Computer Name from System Settings.
+fn default_device_name() -> String {
+    #[cfg(target_os = "macos")]
+    if let Ok(out) = std::process::Command::new("scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+    {
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if out.status.success() && !name.is_empty() {
+            return name;
+        }
+    }
+    let host = gethostname::gethostname()
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    if host.is_empty() {
+        "unnamed device".into()
+    } else {
+        host
+    }
 }
 
 fn mode_label(mode: &str) -> &str {
