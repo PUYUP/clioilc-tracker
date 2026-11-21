@@ -46,8 +46,12 @@ impl<'a> Ingest<'a> {
         Ok(())
     }
 
+    /// Store what was read, then look up the git commits of shell commands
+    /// that just finished (see `clioilc_core::git`).
     pub fn commit(&mut self) -> Result<()> {
-        self.db.commit()
+        self.db.commit()?;
+        self.db.resolve_commits()?;
+        Ok(())
     }
 }
 

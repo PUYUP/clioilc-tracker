@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use clioilc_core::usage::{
     Message, Prompt, Record, Status, TextBlock, TextKind, ToolCall, ToolResult, Usage,
 };
-use clioilc_core::{home_dir, Reader};
+use clioilc_core::{git, home_dir, Reader};
 use memchr::memmem;
 use serde::de::{self, IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -79,6 +79,8 @@ struct Line {
     #[serde(default, deserialize_with = "string_or_none")]
     error: Option<String>,
     timestamp: Option<DateTime<Utc>>,
+    /// Folder the session runs in; locates git commits of shell commands.
+    cwd: Option<String>,
     message: Option<LineMessage>,
 }
 
@@ -165,6 +167,7 @@ impl Line {
         let (Some(session_id), Some(timestamp)) = (self.session_id, self.timestamp) else {
             return Vec::new();
         };
+        let cwd = self.cwd;
         match self.kind.as_str() {
             "assistant" => {
                 let (Some(id), Some(line_id)) = (msg.id, self.uuid) else {
@@ -203,12 +206,18 @@ impl Line {
                         "thinking" => blocks.extend(text_block(TextKind::Thinking, b.thinking)),
                         "tool_use" => {
                             if let (Some(id), Some(name)) = (b.id, b.name) {
-                                let summary = summarize(&b.input.unwrap_or_default());
+                                let input = b.input.unwrap_or_default();
+                                let summary = summarize(&input);
+                                let git_dirs = match (name.as_str(), &input.command) {
+                                    ("Bash", Some(cmd)) => git::commit_dirs(cmd, cwd.as_deref()),
+                                    _ => Vec::new(),
+                                };
                                 tool_calls.push(ToolCall {
                                     id,
                                     name: public_tool_name(&name),
                                     full_name: name,
                                     summary,
+                                    git_dirs,
                                 });
                             }
                         }
@@ -239,9 +248,16 @@ impl Line {
                                 continue;
                             };
                             let is_error = b.is_error.unwrap_or(false);
+                            let commits = if is_error {
+                                Vec::new()
+                            } else {
+                                git::parse_output(&b.content.0)
+                            };
                             records.push(Record::ToolResult(ToolResult {
                                 tool_call_id,
                                 is_error,
+                                timestamp: Some(timestamp),
+                                commits,
                                 error_text: is_error
                                     .then_some(b.content.0)
                                     .filter(|t| !t.is_empty()),
@@ -562,6 +578,28 @@ mod tests {
                 ("mcp", "mcp__acme_crm__lookup", "Find customer"),
             ]
         );
+    }
+
+    #[test]
+    fn finds_git_commits_of_shell_commands() {
+        let call = r#"{"type":"assistant","uuid":"l1","sessionId":"s1","timestamp":"2026-11-20T01:00:00Z","cwd":"/w/app","message":{"id":"msg_g","model":"m","content":[{"type":"tool_use","id":"tu_g","name":"Bash","input":{"command":"cd api && git commit -q -m x","description":"Commit"}},{"type":"tool_use","id":"tu_l","name":"Bash","input":{"command":"git log"}}]}}"#;
+        let m = one_message(call);
+        let dirs: Vec<_> = m.tool_calls.iter().map(|c| c.git_dirs.clone()).collect();
+        assert_eq!(dirs, [vec!["/w/app/api".to_string()], vec![]]);
+
+        let result = r#"{"type":"user","uuid":"u1","sessionId":"s1","timestamp":"2026-11-20T01:00:04Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_g","content":"[main 3c514b0] Fix login\n 1 file changed"},{"type":"tool_result","tool_use_id":"tu_e","is_error":true,"content":"[main 1234567] not trusted on error"}]}}"#;
+        let results: Vec<_> = parse(result)
+            .into_iter()
+            .filter_map(|r| match r {
+                Record::ToolResult(t) => Some((t.tool_call_id, t.timestamp.is_some(), t.commits)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results[0].0, "tu_g");
+        assert!(results[0].1);
+        assert_eq!(results[0].2[0].hash, "3c514b0");
+        assert_eq!(results[0].2[0].subject, "Fix login");
+        assert!(results[1].2.is_empty());
     }
 
     #[test]

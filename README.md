@@ -222,7 +222,22 @@ Activity on 2026-11-20
 07:51:13  tool   Bash [ok] List project files and Rust line counts: find . -path ./clioilc/target …
 07:52:32  you    ya kerjakan semua
 07:57:38  tool   Bash [ERROR] End-to-end test of watch, history, summary, errors: cargo build … -> Exit code 1
+08:02:11  tool   Bash [ok] Commit and push: cd backend && git commit -q -F - …
+                commit f1fc3de4a2 (main) Member settings return project id and mode …
 ```
+
+**Commit git yang dibuat agent** ditampilkan di bawah aksi tool-nya, lengkap dengan hash,
+branch, dan subjek. Hal yang sama juga muncul di dashboard Activity, dengan tombol salin dan
+link ke GitHub, GitLab, Bitbucket, atau Codeberg. Tracker menemukannya di laptop dengan dua
+cara:
+
+- dari output `git commit` (`[main 3c514b0] Subjek`);
+- kalau output-nya kosong (misalnya `git commit -q`), lewat `git log` di folder tempat
+  perintah itu menjalankan git. Folder itu diikuti dari `cd <folder>` dan `git -C <folder>`.
+  Hanya commit yang dibuat dalam rentang waktu aksi tool itu yang diambil.
+
+Riwayat lama ikut terisi setelah `usage import`, selama repo-nya masih ada di laptop. Kalau
+repo-nya sudah tidak ada, hash yang tercetak tetap disimpan apa adanya.
 
 | Penanda | Arti |
 |---|---|

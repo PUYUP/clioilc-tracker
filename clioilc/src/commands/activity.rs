@@ -22,7 +22,8 @@ pub fn run(store: &Store, opts: Options) -> Result<()> {
     let start = local_midnight(day)?;
     let end = local_midnight(day.succ_opt().context("date out of range")?)?;
 
-    let db = UsageDb::open(&store.usage_db_path())?;
+    let mut db = UsageDb::open(&store.usage_db_path())?;
+    db.resolve_commits()?;
     let items: Vec<ActivityItem> = db
         .activity(start, end)?
         .into_iter()
@@ -70,6 +71,7 @@ fn print_items(
         }
         let time = item.ts.with_timezone(&Local).format("%H:%M:%S");
         let sub = if item.is_subagent { " [subagent]" } else { "" };
+        let mut commits: &[clioilc_core::git::Commit] = &[];
         let (tag, text) = match &item.kind {
             ActivityKind::Prompt => ("you   ".to_string(), item.text.clone()),
             ActivityKind::Text => ("agent ".to_string(), item.text.clone()),
@@ -78,7 +80,9 @@ fn print_items(
                 name,
                 status,
                 error,
+                commits: made,
             } => {
+                commits = made;
                 let mark = match status.as_deref() {
                     Some("ok") => "ok",
                     Some("error") => "ERROR",
@@ -96,6 +100,19 @@ fn print_items(
             writeln!(out, "{time}  {tag}{sub} {}", indent(&text))?;
         } else {
             writeln!(out, "{time}  {tag}{sub} {}", one_line(&text, LINE))?;
+        }
+        for c in commits {
+            let branch = c
+                .branch
+                .as_deref()
+                .map(|b| format!(" ({b})"))
+                .unwrap_or_default();
+            let line = format!(
+                "commit {}{branch} {}",
+                &c.hash[..c.hash.len().min(10)],
+                c.subject
+            );
+            writeln!(out, "                {}", one_line(&line, LINE))?;
         }
     }
     Ok(())

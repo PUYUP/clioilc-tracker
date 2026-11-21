@@ -137,6 +137,7 @@ impl Syncer {
     /// Upload everything pending, batch by batch, then (E2E accounts) the
     /// team copies of linked folders.
     pub fn run(&mut self) -> Result<Totals> {
+        self.db.resolve_commits()?;
         let totals = self.run_personal()?;
         self.team_uploaded = 0;
         let due = self.last_team.is_none_or(|t| t.elapsed() >= TEAM_EVERY) || totals.private > 0;

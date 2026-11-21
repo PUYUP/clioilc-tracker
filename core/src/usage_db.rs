@@ -107,7 +107,12 @@ CREATE TABLE IF NOT EXISTS private_tool_calls (
     full_name TEXT,                   -- real tool name, e.g. mcp__server__tool
     summary   TEXT,                   -- command, file path, URL, ...
     error     TEXT,                   -- error output when the call failed
-    synced_at TEXT
+    synced_at TEXT,
+    commits   TEXT,                   -- JSON list of {hash, branch, subject, remote}
+    -- local only, to find commits: folders, end time, done flag
+    git_dirs  TEXT,                   -- JSON list of repository folders
+    result_ts TEXT,
+    commits_checked INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS private_tool_calls_ts ON private_tool_calls(ts);
 
@@ -193,19 +198,19 @@ ON CONFLICT(id) DO UPDATE SET
 WHERE private_tool_calls.error IS NOT excluded.error";
 
 const ACTIVITY: &str = "
-SELECT p.ts, pp.name, p.session_id, p.is_subagent, 'prompt', NULL, p.text, NULL, NULL
+SELECT p.ts, pp.name, p.session_id, p.is_subagent, 'prompt', NULL, p.text, NULL, NULL, NULL
 FROM private_prompts p
 LEFT JOIN private_projects pp ON pp.project_id = p.project_id
 WHERE p.ts >= ?1 AND p.ts < ?2
 UNION ALL
-SELECT b.ts, pp.name, m.session_id, m.is_subagent, b.kind, NULL, b.text, NULL, NULL
+SELECT b.ts, pp.name, m.session_id, m.is_subagent, b.kind, NULL, b.text, NULL, NULL, NULL
 FROM private_blocks b
 JOIN messages m ON m.id = b.message_id
 LEFT JOIN private_projects pp ON pp.project_id = m.project_id
 WHERE b.ts >= ?1 AND b.ts < ?2
 UNION ALL
 SELECT pt.ts, pp.name, m.session_id, m.is_subagent, 'tool', pt.full_name, pt.summary,
-       t.status, pt.error
+       t.status, pt.error, pt.commits
 FROM private_tool_calls pt
 JOIN tool_calls t ON t.id = pt.id
 JOIN messages m ON m.id = t.message_id
@@ -254,6 +259,8 @@ pub enum ActivityKind {
         /// `ok`, `error`, or `None` while the result is pending.
         status: Option<String>,
         error: Option<String>,
+        /// Git commits the action made.
+        commits: Vec<crate::git::Commit>,
     },
 }
 
@@ -359,6 +366,15 @@ impl UsageDb {
                     truncate(&call.full_name, 128),
                     private_text(&call.summary, MAX_SUMMARY),
                 ])?;
+            if !call.git_dirs.is_empty() {
+                // Local only: no re-sync. Backfilled by a later `usage import`.
+                self.conn
+                    .prepare_cached(
+                        "UPDATE private_tool_calls SET git_dirs = ?2
+                         WHERE id = ?1 AND git_dirs IS NULL",
+                    )?
+                    .execute(params![call_id, serde_json::to_string(&call.git_dirs)?])?;
+            }
         }
         Ok(())
     }
@@ -374,7 +390,94 @@ impl UsageDb {
                 .prepare_cached(UPSERT_PRIVATE_TOOL_ERROR)?
                 .execute(params![id, private_text(error, MAX_ERROR)])?;
         }
+        if let Some(ts) = r.timestamp {
+            self.conn
+                .prepare_cached(
+                    "UPDATE private_tool_calls SET result_ts = ?2
+                     WHERE id = ?1 AND result_ts IS NULL",
+                )?
+                .execute(params![id, private_ts(ts)])?;
+        }
+        if !r.commits.is_empty() {
+            // As printed; resolve_commits() completes them from the repository.
+            let commits: Vec<_> = r
+                .commits
+                .iter()
+                .map(|c| crate::git::Commit {
+                    subject: private_text(&c.subject, 300),
+                    ..c.clone()
+                })
+                .collect();
+            self.conn
+                .prepare_cached(
+                    "UPDATE private_tool_calls SET commits = ?2, synced_at = NULL
+                     WHERE id = ?1 AND commits IS NULL",
+                )?
+                .execute(params![id, serde_json::to_string(&commits)?])?;
+        }
         Ok(())
+    }
+
+    /// Complete the commits of finished shell commands that ran git in a
+    /// repository on this machine (see [`crate::git`]). Each call is looked
+    /// at once. Returns how many tool calls got commits.
+    pub fn resolve_commits(&mut self) -> Result<usize> {
+        self.commit()?;
+        let pending: Vec<PendingCommits> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT p.id, p.ts, p.result_ts, p.git_dirs, p.commits, t.status
+                 FROM private_tool_calls p JOIN tool_calls t ON t.id = p.id
+                 WHERE p.git_dirs IS NOT NULL AND p.commits_checked = 0
+                   AND t.status IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let epoch = |ts: &Option<String>| {
+            ts.as_deref()
+                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.timestamp())
+        };
+        let mut found = 0;
+        for (id, ts, result_ts, dirs, current, status) in pending {
+            let printed = parse_commits(current.clone());
+            let commits = match (status.as_deref(), epoch(&ts)) {
+                (Some("ok"), Some(from)) => {
+                    let dirs: Vec<String> = serde_json::from_str(&dirs).unwrap_or_default();
+                    let to = epoch(&result_ts).unwrap_or(from + 600);
+                    crate::git::resolve(&printed, &dirs, from, to)
+                }
+                _ => printed,
+            };
+            let json = (!commits.is_empty())
+                .then(|| serde_json::to_string(&commits))
+                .transpose()?;
+            if json != current {
+                self.conn.execute(
+                    "UPDATE private_tool_calls
+                     SET commits = ?2, commits_checked = 1, synced_at = NULL WHERE id = ?1",
+                    params![id, json],
+                )?;
+            } else {
+                self.conn.execute(
+                    "UPDATE private_tool_calls SET commits_checked = 1 WHERE id = ?1",
+                    params![id],
+                )?;
+            }
+            if json.is_some() {
+                found += 1;
+            }
+        }
+        Ok(found)
     }
 
     fn insert_prompt(&mut self, project: &str, p: &Prompt) -> Result<()> {
@@ -467,6 +570,7 @@ impl UsageDb {
                     name: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
                     status: r.get(7)?,
                     error: r.get(8)?,
+                    commits: parse_commits(r.get(9)?),
                 },
                 _ => ActivityKind::Text,
             };
@@ -544,7 +648,7 @@ impl UsageDb {
         let since = since.unwrap_or("");
         let mut out = Vec::new();
         let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.ts, p.full_name, p.summary, p.error
+            "SELECT p.id, p.ts, p.full_name, p.summary, p.error, p.commits
              FROM private_tool_calls p
              JOIN tool_calls t ON t.id = p.id
              JOIN messages m ON m.id = t.message_id
@@ -555,11 +659,7 @@ impl UsageDb {
                 kind: "tool_call",
                 id: r.get(0)?,
                 ts: r.get(1)?,
-                data: json!({
-                    "full_name": r.get::<_, Option<String>>(2)?,
-                    "summary": r.get::<_, Option<String>>(3)?,
-                    "error": r.get::<_, Option<String>>(4)?,
-                }),
+                data: tool_call_data(r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?),
             })
         })?;
         for row in rows {
@@ -949,7 +1049,7 @@ fn read_claimed(conn: &Connection) -> Result<SyncBatch> {
         },
     )?;
     push(
-        "SELECT p.id, p.ts, p.full_name, p.summary, p.error, m.project_id
+        "SELECT p.id, p.ts, p.full_name, p.summary, p.error, m.project_id, p.commits
          FROM private_tool_calls p
          LEFT JOIN tool_calls t ON t.id = p.id
          LEFT JOIN messages m ON m.id = t.message_id",
@@ -959,11 +1059,7 @@ fn read_claimed(conn: &Connection) -> Result<SyncBatch> {
                 id: r.get(0)?,
                 ts: r.get(1)?,
                 project_id: r.get(5)?,
-                data: json!({
-                    "full_name": r.get::<_, Option<String>>(2)?,
-                    "summary": r.get::<_, Option<String>>(3)?,
-                    "error": r.get::<_, Option<String>>(4)?,
-                }),
+                data: tool_call_data(r.get(2)?, r.get(3)?, r.get(4)?, r.get(6)?),
             })
         },
     )?;
@@ -975,6 +1071,14 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("messages", "cache_write_5m_tokens", "INTEGER"),
     ("messages", "cache_write_1h_tokens", "INTEGER"),
     ("messages", "speed", "TEXT"),
+    ("private_tool_calls", "commits", "TEXT"),
+    ("private_tool_calls", "git_dirs", "TEXT"),
+    ("private_tool_calls", "result_ts", "TEXT"),
+    (
+        "private_tool_calls",
+        "commits_checked",
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -989,6 +1093,38 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A finished shell command waiting for its commits to be looked up:
+/// (id, start, end, git_dirs JSON, commits JSON, status).
+type PendingCommits = (
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+/// The private data of a tool call as uploaded; `commits` only when there are some.
+fn tool_call_data(
+    full_name: Option<String>,
+    summary: Option<String>,
+    error: Option<String>,
+    commits: Option<String>,
+) -> serde_json::Value {
+    let mut data =
+        serde_json::json!({ "full_name": full_name, "summary": summary, "error": error });
+    let commits = parse_commits(commits);
+    if !commits.is_empty() {
+        data["commits"] = serde_json::json!(commits);
+    }
+    data
+}
+
+fn parse_commits(json: Option<String>) -> Vec<crate::git::Commit> {
+    json.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 fn private_ts(ts: DateTime<Utc>) -> String {
@@ -1106,9 +1242,53 @@ mod tests {
                     name: (*name).into(),
                     full_name: (*name).into(),
                     summary: (*summary).into(),
+                    git_dirs: Vec::new(),
                 })
                 .collect(),
         })
+    }
+
+    #[test]
+    fn keeps_the_commits_a_tool_call_made() {
+        let dir = std::env::temp_dir().join(format!("clioilc-commits-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = UsageDb::open(&dir.join("usage.db")).unwrap();
+        let mut msg = message("msg_c", "lc", 5, "", &[("tu_c", "Bash", "commit it")]);
+        if let Record::Message(m) = &mut msg {
+            m.tool_calls[0].git_dirs = vec!["/nonexistent/clioilc-repo".into()];
+        }
+        db.insert("claude", Some("proj"), &msg).unwrap();
+        let printed = crate::git::parse_output("[main 3c514b0] Fix login");
+        let result = Record::ToolResult(ToolResult {
+            tool_call_id: "tu_c".into(),
+            is_error: false,
+            error_text: None,
+            timestamp: Some(at(5)),
+            commits: printed.clone(),
+        });
+        db.insert("claude", Some("proj"), &result).unwrap();
+        db.commit().unwrap();
+        // The repository is gone: the printed commit stays, looked at once.
+        assert_eq!(db.resolve_commits().unwrap(), 1);
+        assert_eq!(db.resolve_commits().unwrap(), 0);
+
+        let tool = db
+            .activity(at(0), at(59))
+            .unwrap()
+            .into_iter()
+            .find_map(|a| match a.kind {
+                ActivityKind::Tool { commits, .. } => Some(commits),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(tool, printed);
+        let project = db.project_key("proj");
+        let shared = db.team_candidates(&project, None, false).unwrap();
+        assert_eq!(shared[0].data["commits"][0]["hash"], "3c514b0");
+        assert_eq!(shared[0].data["commits"][0]["branch"], "main");
+        // The local helpers are never uploaded.
+        assert!(shared[0].data.get("git_dirs").is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn all_rows(db: &UsageDb, tables: &[&str]) -> String {
@@ -1159,6 +1339,8 @@ mod tests {
             tool_call_id: "tu_1".into(),
             is_error: true,
             error_text: Some("boom".into()),
+            timestamp: None,
+            commits: Vec::new(),
         });
         db.insert("claude", Some("proj"), &result).unwrap();
         db.commit().unwrap();
@@ -1186,7 +1368,8 @@ mod tests {
                     &ActivityKind::Tool {
                         name: "Bash".into(),
                         status: Some("error".into()),
-                        error: Some("boom".into())
+                        error: Some("boom".into()),
+                        commits: Vec::new(),
                     },
                     "ls"
                 ),

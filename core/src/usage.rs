@@ -93,6 +93,9 @@ pub struct ToolCall {
     pub full_name: String,
     /// Private: a one-line description of the action (command, file, URL).
     pub summary: String,
+    /// Local only: folders a shell command creates git commits in (see
+    /// [`crate::git::commit_dirs`]); empty for other actions.
+    pub git_dirs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +104,10 @@ pub struct ToolResult {
     pub is_error: bool,
     /// Private: the error output, if the call failed.
     pub error_text: Option<String>,
+    /// When the result was logged (the tool call ended).
+    pub timestamp: Option<DateTime<Utc>>,
+    /// Private: commits the output announced (`[main 3c514b0] Subject`).
+    pub commits: Vec<crate::git::Commit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

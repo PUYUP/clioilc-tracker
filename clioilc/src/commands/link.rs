@@ -70,67 +70,11 @@ fn folder(path: Option<PathBuf>) -> Result<(PathBuf, String)> {
     Ok((dir, name))
 }
 
-/// A git remote in one comparable form, e.g. `git@github.com:Acme/API.git`
-/// -> `github.com/acme/api`. Same rules as the backend's
-/// apps/workspaces/git.py (see GIT_REMOTE_CASES in both test suites).
-pub fn normalize_remote(raw: &str) -> Option<String> {
-    let s = raw.trim();
-    let (host, path) = if let Some(i) = s.find("://") {
-        let scheme = &s[..i];
-        let mut chars = scheme.chars();
-        if !chars.next()?.is_ascii_alphabetic()
-            || !chars.all(|c| c.is_ascii_alphanumeric() || "+.-".contains(c))
-        {
-            return None;
-        }
-        let (authority, path) = s[i + 3..].split_once('/')?;
-        let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-        (host_port.split(':').next()?, path)
-    } else {
-        // scp-like: [user@]host:path
-        let (before, path) = s.split_once(':')?;
-        let host = match before.rsplit_once('@') {
-            Some((user, host)) if !user.is_empty() && !user.contains('/') => host,
-            Some(_) => return None,
-            None => before,
-        };
-        if host.contains('/') || path.starts_with('/') {
-            return None;
-        }
-        (host, path)
-    };
-    let path = path.trim_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path).trim_matches('/');
-    let out = format!("{host}/{path}").to_lowercase();
-    let (h, rest) = out.split_once('/')?;
-    let host_ok = !h.is_empty()
-        && h.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-');
-    let path_ok = rest
-        .split('/')
-        .all(|seg| !seg.is_empty() && !seg.chars().any(char::is_whitespace));
-    (host_ok && path_ok).then_some(out)
-}
+pub use clioilc_core::git::normalize_remote;
 
 /// The folder's git remote: `origin`, else the first one.
 fn folder_remote(dir: &Path) -> Option<String> {
-    let git = |args: &[&str]| -> Option<String> {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-    };
-    let remotes = git(&["remote"])?;
-    let name = remotes
-        .lines()
-        .find(|r| *r == "origin")
-        .or_else(|| remotes.lines().next())?;
-    git(&["remote", "get-url", name])
+    clioilc_core::git::remote_url(&dir.to_string_lossy())
 }
 
 /// `clioilc link` without a target: the one linkable project whose git
