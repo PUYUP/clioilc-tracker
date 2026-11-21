@@ -646,6 +646,36 @@ impl UsageDb {
             .collect()
     }
 
+    /// Make `account` (server + user) the one this database syncs to. When
+    /// it was another account, or none was recorded yet, every row is marked
+    /// unsent so the account gets this machine's whole history (uploads are
+    /// idempotent). Returns whether that happened.
+    pub fn claim_account(&mut self, account: &str) -> Result<bool> {
+        self.commit()?;
+        let current: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'sync_account'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if current.as_deref() == Some(account.as_bytes()) {
+            return Ok(false);
+        }
+        let tx = self.conn.transaction()?;
+        for table in PUBLIC_TABLES.iter().chain(PRIVATE_TABLES) {
+            tx.execute(&format!("UPDATE {table} SET synced_at = NULL"), [])?;
+        }
+        tx.execute("DELETE FROM team_sync", [])?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('sync_account', ?1)",
+            [account.as_bytes()],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub(crate) fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -1382,6 +1412,32 @@ mod tests {
                 })
                 .collect(),
         })
+    }
+
+    #[test]
+    fn another_account_gets_the_whole_history() {
+        let dir = std::env::temp_dir().join(format!("clioilc-account-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = UsageDb::open(&dir.join("usage.db")).unwrap();
+        db.insert(
+            "claude",
+            Some("proj"),
+            &message("msg_a", "la", 5, "hi", &[]),
+        )
+        .unwrap();
+        db.commit().unwrap();
+        assert!(db.claim_account("http://s#alice").unwrap());
+        let batch = db.sync_claim(100).unwrap();
+        assert!(!batch.is_empty());
+        db.sync_finish(true, at(1)).unwrap();
+        // Same account: nothing to resend.
+        assert!(!db.claim_account("http://s#alice").unwrap());
+        assert_eq!(db.sync_claim(100).unwrap().len(), 0);
+        db.sync_finish(true, at(2)).unwrap();
+        // Another account: everything again.
+        assert!(db.claim_account("http://s#bob").unwrap());
+        assert_eq!(db.sync_claim(100).unwrap().len(), batch.len());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

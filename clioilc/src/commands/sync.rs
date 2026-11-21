@@ -109,6 +109,15 @@ impl Syncer {
             team_uploaded: 0,
         };
         syncer.check_salt()?;
+        // History synced to another account (e.g. after logging in as a new
+        // one on this machine) must go to this one too.
+        let account = format!("{}#{}", syncer.auth.server, syncer.auth.username);
+        if syncer.db.claim_account(&account)? {
+            eprintln!(
+                "first sync of this machine to {}: uploading its whole history",
+                syncer.auth.username
+            );
+        }
         Ok(syncer)
     }
 
