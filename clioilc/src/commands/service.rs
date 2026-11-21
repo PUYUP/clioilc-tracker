@@ -184,37 +184,47 @@ mod platform {
         let path = plist_path(spec)?;
         let target = format!("{}/{}", domain()?, spec.label);
         // Reinstall: unload the old definition first (ignore "not loaded").
-        let _ = run("launchctl", &["bootout", &target]);
+        unload(&target)?;
         write_file(&path, &plist(spec))?;
-        let out = run(
-            "launchctl",
-            &["bootstrap", &domain()?, &path.to_string_lossy()],
-        )?;
-        if !out.status.success() {
-            bail!(
-                "launchctl bootstrap failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        // launchd can still refuse for a moment after the old job is gone
+        // ("Bootstrap failed: 5: Input/output error"), so retry briefly.
+        let mut last = String::new();
+        for _ in 0..20 {
+            let out = run(
+                "launchctl",
+                &["bootstrap", &domain()?, &path.to_string_lossy()],
+            )?;
+            if out.status.success() {
+                return Ok(());
+            }
+            last = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            std::thread::sleep(std::time::Duration::from_millis(250));
         }
-        Ok(())
+        bail!("launchctl bootstrap failed: {last}")
     }
 
     pub fn uninstall(spec: &Spec) -> Result<bool> {
         let path = plist_path(spec)?;
         let target = format!("{}/{}", domain()?, spec.label);
-        let loaded = run("launchctl", &["bootout", &target])?.status.success();
-        // bootout returns before the job is gone; wait so `status` agrees.
-        for _ in 0..40 {
-            if !run("launchctl", &["print", &target])?.status.success() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
-        }
+        let loaded = unload(&target)?;
         let existed = path.exists();
         if existed {
             fs::remove_file(&path)?;
         }
         Ok(loaded || existed)
+    }
+
+    /// `launchctl bootout`, then wait until the job is really gone: bootout
+    /// returns before that, and a bootstrap right after it fails.
+    fn unload(target: &str) -> Result<bool> {
+        let loaded = run("launchctl", &["bootout", target])?.status.success();
+        for _ in 0..40 {
+            if !run("launchctl", &["print", target])?.status.success() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        Ok(loaded)
     }
 
     pub fn status(spec: &Spec) -> Result<String> {
