@@ -930,6 +930,19 @@ impl UsageDb {
     /// Claimed rows are marked `sending`. A row that changes while in
     /// flight is reset to NULL by its upsert, so [`UsageDb::sync_finish`]
     /// will not mark it synced and the new version goes in the next batch.
+    /// New prompts, replies or tool calls not uploaded yet: work items may
+    /// have changed.
+    pub fn has_unsynced_activity(&mut self) -> Result<bool> {
+        self.commit()?;
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM private_prompts WHERE synced_at IS NULL)
+                 OR EXISTS(SELECT 1 FROM private_blocks WHERE synced_at IS NULL)
+                 OR EXISTS(SELECT 1 FROM private_tool_calls WHERE synced_at IS NULL)",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn sync_claim(&mut self, limit: usize) -> Result<SyncBatch> {
         self.commit()?;
         let tx = self.conn.transaction()?;
@@ -1723,6 +1736,7 @@ mod tests {
         db.commit().unwrap();
         let total = pending(&db);
         assert!(total >= 5, "messages, tool call, project and private rows");
+        assert!(db.has_unsynced_activity().unwrap(), "new activity");
 
         let first = db.sync_claim(2).unwrap();
         assert_eq!(first.len(), 2);
@@ -1732,6 +1746,8 @@ mod tests {
 
         let rest = db.sync_claim(100).unwrap();
         assert_eq!(rest.len() as u64, total - 2);
+        db.sync_finish(true, at(0)).unwrap();
+        assert!(!db.has_unsynced_activity().unwrap(), "all sent");
         let kinds: Vec<_> = rest.private.iter().map(|p| p.kind).collect();
         assert!(kinds.contains(&"project") && kinds.contains(&"block"));
         let project = rest.private.iter().find(|p| p.kind == "project").unwrap();

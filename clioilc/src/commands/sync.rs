@@ -61,8 +61,10 @@ pub struct Syncer {
     _lock: File,
     /// E2E team sync (commands/team.rs): when it last ran, and its notes.
     last_team: Option<std::time::Instant>,
-    /// Journal work items (clioilc_core::journal): when they were last rebuilt.
+    /// Journal work items (clioilc_core::journal): when they were last
+    /// rebuilt, and whether activity arrived since.
     last_journal: Option<std::time::Instant>,
+    journal_dirty: bool,
     pub team_notes: Vec<String>,
     pub team_uploaded: usize,
 }
@@ -70,6 +72,10 @@ pub struct Syncer {
 /// Team sync runs after the personal sync, at most this often unless new
 /// private data arrived.
 const TEAM_EVERY: Duration = Duration::from_secs(300);
+/// Work items are rebuilt soon after new activity (a rebuild reads all
+/// events and asks git, about a second), and at least every TEAM_EVERY for
+/// what depends on time or on the repository (a push from a terminal).
+const JOURNAL_AFTER_ACTIVITY: Duration = Duration::from_secs(30);
 
 impl Syncer {
     /// Fails if not logged in, another sync holds the lock, or usage.db was
@@ -108,6 +114,7 @@ impl Syncer {
             _lock: lock,
             last_team: None,
             last_journal: None,
+            journal_dirty: false,
             team_notes: Vec::new(),
             team_uploaded: 0,
         };
@@ -162,8 +169,17 @@ impl Syncer {
     /// team copies of linked folders.
     pub fn run(&mut self) -> Result<Totals> {
         self.db.resolve_commits()?;
-        if self.last_journal.is_none_or(|t| t.elapsed() >= TEAM_EVERY) {
+        self.journal_dirty |= self.db.has_unsynced_activity()?;
+        let due = match self.last_journal {
+            None => true,
+            Some(t) => {
+                t.elapsed() >= TEAM_EVERY
+                    || (self.journal_dirty && t.elapsed() >= JOURNAL_AFTER_ACTIVITY)
+            }
+        };
+        if due {
             self.last_journal = Some(std::time::Instant::now());
+            self.journal_dirty = false;
             self.db.build_work_items(chrono::Utc::now())?;
         }
         let totals = self.run_personal()?;
