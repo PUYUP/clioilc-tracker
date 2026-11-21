@@ -84,7 +84,10 @@ impl Syncer {
             .open(data_dir.join("sync.lock"))?;
         match lock.try_lock() {
             Ok(()) => {}
-            Err(TryLockError::WouldBlock) => bail!("another `clioilc sync` is running"),
+            Err(TryLockError::WouldBlock) => bail!(
+                "another clioilc is already syncing this data (the background service? see \
+                 `clioilc service status`); this one keeps recording and takes over if it stops"
+            ),
             Err(TryLockError::Error(e)) => return Err(e).context("locking sync.lock"),
         }
         let client = Client::new(&auth.server, Some(&auth.token))?;
@@ -144,6 +147,15 @@ impl Syncer {
             );
         }
         Ok(())
+    }
+
+    /// `clioilc login` replaced the credentials this syncer was opened with
+    /// (another account, or a new token for the same one).
+    pub fn login_changed(&self) -> bool {
+        auth::load(&self.data_dir)
+            .ok()
+            .flatten()
+            .is_none_or(|a| a.token != self.auth.token || a.server != self.auth.server)
     }
 
     /// Upload everything pending, batch by batch, then (E2E accounts) the
@@ -271,6 +283,13 @@ pub fn spawn_loop(store: Store, every: Duration, stop: &'static AtomicBool) {
         let mut last_error: Option<String> = None;
         let mut last_notes: Vec<String> = Vec::new();
         while !stop.load(Ordering::SeqCst) {
+            // A new `clioilc login`: switch to it before the old token is
+            // refused (login retires it).
+            if syncer.as_ref().is_some_and(Syncer::login_changed) {
+                syncer = None;
+                last_error = None;
+                eprintln!("login changed: syncing with the new login");
+            }
             let result = match syncer.as_mut() {
                 Some(s) => s.run(),
                 None => Syncer::open(&store).and_then(|s| syncer.insert(s).run()),
@@ -299,7 +318,13 @@ pub fn spawn_loop(store: Store, every: Duration, stop: &'static AtomicBool) {
                     syncer = None;
                     let msg = format!("{err:#}");
                     if last_error.as_deref() != Some(&msg) {
-                        eprintln!("sync error: {msg}");
+                        // Another process holding the lock is not a failure.
+                        let label = if msg.starts_with("another clioilc is already syncing") {
+                            "note"
+                        } else {
+                            "sync error"
+                        };
+                        eprintln!("{label}: {msg}");
                     }
                     last_error = Some(msg);
                 }

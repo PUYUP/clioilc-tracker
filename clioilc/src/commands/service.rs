@@ -82,6 +82,13 @@ pub fn uninstall(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// The background watcher is installed and running.
+pub fn running(store: &Store) -> bool {
+    Spec::new(store)
+        .and_then(|spec| platform::status(&spec))
+        .is_ok_and(|s| s.starts_with("running"))
+}
+
 pub fn status(store: &Store) -> Result<()> {
     let spec = Spec::new(store)?;
     let state = platform::status(&spec)?;

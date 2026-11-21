@@ -164,7 +164,15 @@ pub fn login(store: &Store, opts: Options) -> Result<()> {
         mode_label(&new_auth.enc_mode),
         auth::path(data_dir).display()
     );
-    eprintln!("next: `clioilc sync`, or keep it running with `clioilc watch --sync`");
+    if super::service::running(store) {
+        // It notices the new auth.json on its next round (commands/sync.rs).
+        eprintln!(
+            "the background service switches to this login on its next sync; \
+             no need to start `clioilc watch` by hand"
+        );
+    } else {
+        eprintln!("next: `clioilc sync`, or keep it running with `clioilc service install`");
+    }
     Ok(())
 }
 
