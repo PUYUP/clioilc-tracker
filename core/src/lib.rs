@@ -1,5 +1,6 @@
 pub mod filter;
 pub mod git;
+pub mod journal;
 pub mod reader;
 pub mod redact;
 pub mod store;

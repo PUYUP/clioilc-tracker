@@ -40,6 +40,8 @@ pub struct Message {
     pub blocks: Vec<TextBlock>,
     /// Tool calls requested on this line.
     pub tool_calls: Vec<ToolCall>,
+    /// Private: the git branch the agent was on, if known.
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +110,8 @@ pub struct ToolResult {
     pub timestamp: Option<DateTime<Utc>>,
     /// Private: commits the output announced (`[main 3c514b0] Subject`).
     pub commits: Vec<crate::git::Commit>,
+    /// Private: pull/merge request URLs the output announced (`gh pr create`).
+    pub prs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,4 +123,6 @@ pub struct Prompt {
     pub timestamp: DateTime<Utc>,
     /// Private: the prompt with tool-injected context removed.
     pub text: String,
+    /// Private: the git branch the agent was on, if known.
+    pub branch: Option<String>,
 }

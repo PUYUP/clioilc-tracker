@@ -440,7 +440,7 @@ fn upload(
     let mut pending = Vec::new();
     for link in links {
         for mut c in db.team_candidates(&link.project_key, link.share_from.as_deref(), text)? {
-            if c.kind == "prompt" {
+            if c.kind == "prompt" || (c.kind == "work_item" && c.data.get("deleted").is_none()) {
                 c.data["project_id"] = json!(team_id);
             }
             let plain = serde_json::to_vec(&c.data)?;

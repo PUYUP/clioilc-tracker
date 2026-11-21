@@ -30,6 +30,40 @@ pub struct Commit {
     /// Normalized remote, e.g. `github.com/acme/api` (see [`normalize_remote`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
+    /// Size of the change, from the repository (`git show --numstat`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insertions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<u32>,
+}
+
+/// Files changed, lines added and removed by one commit (binary files
+/// count as changed files without lines).
+fn numstat(dir: &str, hash: &str) -> Option<(u32, u32, u32)> {
+    let out = git(
+        dir,
+        &["show", "--numstat", "--format=", "--no-renames", hash],
+    )?;
+    let (mut files, mut ins, mut del) = (0u32, 0u32, 0u32);
+    for line in out.lines() {
+        let mut f = line.split('\t');
+        let (Some(a), Some(d)) = (f.next(), f.next()) else {
+            continue;
+        };
+        files += 1;
+        ins = ins.saturating_add(a.parse().unwrap_or(0));
+        del = del.saturating_add(d.parse().unwrap_or(0));
+    }
+    Some((files, ins, del))
+}
+
+fn with_stats(mut c: Commit, dir: &str) -> Commit {
+    if let Some((files, ins, del)) = numstat(dir, &c.hash) {
+        (c.files, c.insertions, c.deletions) = (Some(files), Some(ins), Some(del));
+    }
+    c
 }
 
 /// Commits announced in tool output: lines like `[main 3c514b0] Subject`,
@@ -62,7 +96,35 @@ pub fn parse_output(text: &str) -> Vec<Commit> {
             branch: (branch != "detached HEAD").then(|| branch.to_string()),
             subject: cap(subject.trim()),
             remote: None,
+            files: None,
+            insertions: None,
+            deletions: None,
         });
+        if out.len() == MAX_COMMITS {
+            break;
+        }
+    }
+    out
+}
+
+/// Pull/merge request URLs in tool output (`gh pr create`, `glab mr create`).
+/// Only numbered ones: `git push` also prints "create a pull request" links
+/// (`/pull/new/<branch>`), which are not pull requests yet.
+pub fn parse_prs(text: &str) -> Vec<String> {
+    use std::sync::OnceLock;
+    static PR: OnceLock<regex::Regex> = OnceLock::new();
+    let re = PR.get_or_init(|| {
+        regex::Regex::new(
+            r"https://[A-Za-z0-9.-]+/[A-Za-z0-9._/-]+?/(?:pull|-/merge_requests|pull-requests)/[0-9]+\b",
+        )
+        .expect("valid regex")
+    });
+    let mut out: Vec<String> = Vec::new();
+    for m in re.find_iter(text) {
+        let url = m.as_str().to_string();
+        if !out.contains(&url) {
+            out.push(url);
+        }
         if out.len() == MAX_COMMITS {
             break;
         }
@@ -395,11 +457,12 @@ pub fn resolve(printed: &[Commit], dirs: &[String], from: i64, to: i64) -> Vec<C
                 for (dir, remote) in &repos {
                     let spec = format!("{}^{{commit}}", c.hash);
                     if let Some(full) = git(dir, &["rev-parse", "--verify", "--quiet", &spec]) {
-                        return Commit {
+                        let c = Commit {
                             hash: full,
                             remote: remote.clone(),
                             ..c.clone()
                         };
+                        return with_stats(c, dir);
                     }
                 }
                 c.clone()
@@ -430,12 +493,16 @@ pub fn resolve(printed: &[Commit], dirs: &[String], from: i64, to: i64) -> Vec<C
             if ct < from || ct > to || out.iter().any(|c| c.hash == hash) {
                 continue;
             }
-            out.push(Commit {
+            let c = Commit {
                 hash: hash.to_string(),
                 branch: branch_of(dir, hash),
                 subject: cap(subject),
                 remote: remote.clone(),
-            });
+                files: None,
+                insertions: None,
+                deletions: None,
+            };
+            out.push(with_stats(c, dir));
         }
     }
     // Oldest first, as they were made.
@@ -527,6 +594,24 @@ mod tests {
     }
 
     #[test]
+    fn reads_pull_request_urls() {
+        let out = "remote: Create a pull request for 'x' on GitHub by visiting:\n\
+                   remote:   https://github.com/acme/pay/pull/new/x\n\
+                   https://github.com/acme/pay/pull/42\n\
+                   see https://gitlab.com/g/sub/repo/-/merge_requests/7.\n\
+                   https://gitlab.com/g/repo/-/merge_requests/new?merge_request%5Bsource_branch%5D=x\n\
+                   https://bitbucket.org/acme/pay/pull-requests/3 and again https://github.com/acme/pay/pull/42";
+        assert_eq!(
+            parse_prs(out),
+            vec![
+                "https://github.com/acme/pay/pull/42",
+                "https://gitlab.com/g/sub/repo/-/merge_requests/7",
+                "https://bitbucket.org/acme/pay/pull-requests/3",
+            ]
+        );
+    }
+
+    #[test]
     fn finds_the_folders_commits_are_made_in() {
         let cwd = Some("/w/clioilc");
         assert_eq!(commit_dirs("ls -la", cwd), Vec::<String>::new());
@@ -607,7 +692,9 @@ mod tests {
         run(&["remote", "add", "origin", "git@github.com:Acme/Pay.git"]);
         let now = chrono::Utc::now().timestamp();
         run(&["commit", "-q", "--allow-empty", "-m", "First one"]);
-        run(&["commit", "-q", "--allow-empty", "-m", "Second one"]);
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        run(&["add", "a.txt"]);
+        run(&["commit", "-q", "-m", "Second one"]);
         let head = git(&d, &["rev-parse", "HEAD"]).unwrap();
 
         // -q printed nothing: found by time, oldest first, with branch and remote.
@@ -618,6 +705,10 @@ mod tests {
         assert_eq!(found[1].hash, head);
         assert_eq!(found[1].branch.as_deref(), Some("main"));
         assert_eq!(found[1].remote.as_deref(), Some("github.com/acme/pay"));
+        assert_eq!(
+            (found[1].files, found[1].insertions, found[1].deletions),
+            (Some(1), Some(2), Some(0))
+        );
         // Outside the window: nothing.
         assert!(resolve(&[], std::slice::from_ref(&d), now - 600, now - 300).is_empty());
 

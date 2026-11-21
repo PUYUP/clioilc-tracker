@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod add;
 pub mod history;
+pub mod journal;
 pub mod link;
 pub mod login;
 pub mod service;

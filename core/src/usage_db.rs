@@ -89,7 +89,8 @@ CREATE TABLE IF NOT EXISTS private_prompts (
     is_subagent INTEGER NOT NULL,
     ts          TEXT NOT NULL,
     text        TEXT NOT NULL,
-    synced_at   TEXT
+    synced_at   TEXT,
+    branch      TEXT                  -- local only: git branch the agent was on
 );
 CREATE INDEX IF NOT EXISTS private_prompts_ts ON private_prompts(ts);
 CREATE TABLE IF NOT EXISTS private_blocks (
@@ -112,10 +113,21 @@ CREATE TABLE IF NOT EXISTS private_tool_calls (
     -- local only, to find commits: folders, end time, done flag
     git_dirs  TEXT,                   -- JSON list of repository folders
     printed   TEXT,                   -- JSON commits as the tool output printed them
+    prs       TEXT,                   -- JSON pull/merge request URLs the output printed
+    branch    TEXT,                   -- git branch the agent was on
     result_ts TEXT,
     commits_checked INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS private_tool_calls_ts ON private_tool_calls(ts);
+
+-- private: work items of the journal (journal.rs), one JSON document each
+CREATE TABLE IF NOT EXISTS work_items (
+    id         TEXT PRIMARY KEY,      -- keyed hash of the opening prompt
+    project_id TEXT NOT NULL,
+    ts         TEXT NOT NULL,         -- last activity
+    data       TEXT NOT NULL,         -- JSON document, or the deleted marker
+    synced_at  TEXT
+);
 
 -- local only: what team sync (E2E workspaces) already uploaded ---------
 CREATE TABLE IF NOT EXISTS team_sync (
@@ -135,6 +147,7 @@ pub const PRIVATE_TABLES: &[&str] = &[
     "private_prompts",
     "private_blocks",
     "private_tool_calls",
+    "work_items",
 ];
 
 const UPSERT_MESSAGE: &str = "
@@ -367,6 +380,13 @@ impl UsageDb {
                     truncate(&call.full_name, 128),
                     private_text(&call.summary, MAX_SUMMARY),
                 ])?;
+            if let Some(branch) = &m.branch {
+                self.conn
+                    .prepare_cached(
+                        "UPDATE private_tool_calls SET branch = ?2 WHERE id = ?1 AND branch IS NULL",
+                    )?
+                    .execute(params![call_id, truncate(branch, 250)])?;
+            }
             if !call.git_dirs.is_empty() {
                 // Local only: no re-sync. Backfilled by a later `usage import`.
                 self.conn
@@ -398,6 +418,14 @@ impl UsageDb {
                      WHERE id = ?1 AND result_ts IS NULL",
                 )?
                 .execute(params![id, private_ts(ts)])?;
+        }
+        if !r.prs.is_empty() {
+            self.conn
+                .prepare_cached(
+                    "UPDATE private_tool_calls SET prs = ?2, synced_at = NULL
+                     WHERE id = ?1 AND prs IS NULL",
+                )?
+                .execute(params![id, serde_json::to_string(&r.prs)?])?;
         }
         if !r.commits.is_empty() {
             // As printed; resolve_commits() completes them from the repository.
@@ -507,6 +535,14 @@ impl UsageDb {
                 private_ts(p.timestamp),
                 private_text(&p.text, MAX_TEXT)
             ])?;
+        if let Some(branch) = &p.branch {
+            // Local only; backfilled by a later `usage import`.
+            self.conn
+                .prepare_cached(
+                    "UPDATE private_prompts SET branch = ?2 WHERE id = ?1 AND branch IS NULL",
+                )?
+                .execute(params![id, truncate(branch, 250)])?;
+        }
         Ok(())
     }
 
@@ -610,6 +646,10 @@ impl UsageDb {
             .collect()
     }
 
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     /// The hashing salt. Shared by all devices of an account once logged in.
     pub fn salt(&self) -> &[u8] {
         &self.salt
@@ -657,7 +697,7 @@ impl UsageDb {
         let since = since.unwrap_or("");
         let mut out = Vec::new();
         let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.ts, p.full_name, p.summary, p.error, p.commits
+            "SELECT p.id, p.ts, p.full_name, p.summary, p.error, p.commits, p.prs
              FROM private_tool_calls p
              JOIN tool_calls t ON t.id = p.id
              JOIN messages m ON m.id = t.message_id
@@ -668,11 +708,45 @@ impl UsageDb {
                 kind: "tool_call",
                 id: r.get(0)?,
                 ts: r.get(1)?,
-                data: tool_call_data(r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?),
+                data: tool_call_data(r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?),
             })
         })?;
         for row in rows {
             out.push(row?);
+        }
+        // Work items: facts always (like tool actions); the title (from a
+        // prompt) and error samples only with text sharing.
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ts, data FROM work_items
+             WHERE project_id = ?1 AND (?2 = '' OR ts >= ?2)",
+        )?;
+        let rows = stmt.query_map(params![project_id, since], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, ts, data) = row?;
+            let mut data: serde_json::Value = serde_json::from_str(&data)?;
+            if !text && data.get("deleted").is_none() {
+                data["title"] = data["commits"][0]["subject"]
+                    .as_str()
+                    .or(data["branch"].as_str())
+                    .map_or(serde_json::Value::Null, |t| json!(t));
+                if let Some(errors) = data["errors"].as_array_mut() {
+                    for e in errors {
+                        e["sample"] = serde_json::Value::Null;
+                    }
+                }
+            }
+            out.push(TeamCandidate {
+                kind: "work_item",
+                id,
+                ts: Some(ts),
+                data,
+            });
         }
         if !text {
             return Ok(out);
@@ -944,7 +1018,7 @@ pub struct TeamCandidate {
 /// (by the server or, end-to-end, by the client).
 #[derive(Debug)]
 pub struct SyncPrivate {
-    /// `project`, `prompt`, `block` or `tool_call`.
+    /// `project`, `prompt`, `block`, `tool_call` or `work_item`.
     pub kind: &'static str,
     pub id: String,
     pub ts: Option<String>,
@@ -1058,7 +1132,7 @@ fn read_claimed(conn: &Connection) -> Result<SyncBatch> {
         },
     )?;
     push(
-        "SELECT p.id, p.ts, p.full_name, p.summary, p.error, m.project_id, p.commits
+        "SELECT p.id, p.ts, p.full_name, p.summary, p.error, m.project_id, p.commits, p.prs
          FROM private_tool_calls p
          LEFT JOIN tool_calls t ON t.id = p.id
          LEFT JOIN messages m ON m.id = t.message_id",
@@ -1068,7 +1142,20 @@ fn read_claimed(conn: &Connection) -> Result<SyncBatch> {
                 id: r.get(0)?,
                 ts: r.get(1)?,
                 project_id: r.get(5)?,
-                data: tool_call_data(r.get(2)?, r.get(3)?, r.get(4)?, r.get(6)?),
+                data: tool_call_data(r.get(2)?, r.get(3)?, r.get(4)?, r.get(6)?, r.get(7)?),
+            })
+        },
+    )?;
+    push(
+        "SELECT p.id, p.ts, p.project_id, p.data FROM work_items p",
+        &|r| {
+            let data: String = r.get(3)?;
+            Ok(SyncPrivate {
+                kind: "work_item",
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                project_id: r.get(2)?,
+                data: serde_json::from_str(&data).unwrap_or_else(|_| json!({ "deleted": true })),
             })
         },
     )?;
@@ -1089,11 +1176,14 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
         "INTEGER NOT NULL DEFAULT 0",
     ),
     ("private_tool_calls", "printed", "TEXT"),
+    ("private_tool_calls", "prs", "TEXT"),
+    ("private_tool_calls", "branch", "TEXT"),
+    ("private_prompts", "branch", "TEXT"),
 ];
 
 /// Version of `git::commit_dirs`. When it changes, the folders of earlier
 /// shell commands are worked out again on the next `usage import`.
-const GIT_DIRS_VERSION: i64 = 2;
+const GIT_DIRS_VERSION: i64 = 3;
 
 fn migrate(conn: &Connection) -> Result<()> {
     migrate_columns(conn)?;
@@ -1150,12 +1240,19 @@ fn tool_call_data(
     summary: Option<String>,
     error: Option<String>,
     commits: Option<String>,
+    prs: Option<String>,
 ) -> serde_json::Value {
     let mut data =
         serde_json::json!({ "full_name": full_name, "summary": summary, "error": error });
     let commits = parse_commits(commits);
     if !commits.is_empty() {
         data["commits"] = serde_json::json!(commits);
+    }
+    let prs: Vec<String> = prs
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if !prs.is_empty() {
+        data["prs"] = serde_json::json!(prs);
     }
     data
 }
@@ -1265,6 +1362,7 @@ mod tests {
                 ..Usage::default()
             },
             speed: None,
+            branch: None,
             blocks: if text.is_empty() {
                 vec![]
             } else {
@@ -1303,6 +1401,7 @@ mod tests {
             error_text: None,
             timestamp: Some(at(5)),
             commits: printed.clone(),
+            prs: vec!["https://github.com/acme/pay/pull/42".into()],
         });
         db.insert("claude", Some("proj"), &result).unwrap();
         db.commit().unwrap();
@@ -1324,8 +1423,21 @@ mod tests {
         let shared = db.team_candidates(&project, None, false).unwrap();
         assert_eq!(shared[0].data["commits"][0]["hash"], "3c514b0");
         assert_eq!(shared[0].data["commits"][0]["branch"], "main");
+        assert_eq!(
+            shared[0].data["prs"][0],
+            "https://github.com/acme/pay/pull/42"
+        );
         // The local helpers are never uploaded.
         assert!(shared[0].data.get("git_dirs").is_none());
+
+        // Work items go to the team; without text sharing, no prompt title.
+        db.build_work_items(at(30)).unwrap();
+        let shared = db.team_candidates(&project, None, false).unwrap();
+        let item = shared.iter().find(|c| c.kind == "work_item").unwrap();
+        assert_eq!(item.data["title"], "Fix login");
+        assert_eq!(item.data["commits"][0]["hash"], "3c514b0");
+        let mine = db.work_items().unwrap();
+        assert_eq!(mine.len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1379,6 +1491,7 @@ mod tests {
             error_text: Some("boom".into()),
             timestamp: None,
             commits: Vec::new(),
+            prs: Vec::new(),
         });
         db.insert("claude", Some("proj"), &result).unwrap();
         db.commit().unwrap();
@@ -1442,6 +1555,7 @@ mod tests {
             is_subagent: false,
             timestamp: at(1),
             text: "please fix secret-project".into(),
+            branch: None,
         });
         db.insert("claude", Some("-Users-me-secret-project"), &prompt)
             .unwrap();

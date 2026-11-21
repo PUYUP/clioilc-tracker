@@ -102,6 +102,12 @@ enum Commands {
         #[command(subcommand)]
         command: ServiceCommands,
     },
+    /// Work items of the last days: what was done, what is pending (private)
+    Journal {
+        /// How many days back (by last activity)
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+    },
     /// What the agent did on a day: prompts, replies, tool actions (private)
     Activity {
         /// Day to show, YYYY-MM-DD in local time (default: today)
@@ -283,6 +289,7 @@ fn main() -> Result<()> {
             },
         ),
         Commands::Links => commands::link::links(&open_store(data_dir)?),
+        Commands::Journal { days } => commands::journal::run(&open_store(data_dir)?, days),
         Commands::Team { command: None } => {
             commands::sync::Syncer::open(&open_store(data_dir)?)?.team()
         }

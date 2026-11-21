@@ -197,6 +197,31 @@ Catatan:
 - Tool call berstatus `NULL` (pending) artinya hasilnya belum ditulis, misalnya tool-nya
   masih berjalan.
 
+### `journal`
+
+Jurnal kerja: setiap **work item** (satu alur kerja di satu proyek dan branch, boleh lintas
+sesi dan hari) beserta statusnya, commit, PR, file yang berubah, dan masalah yang berulang.
+Disusun dari `usage.db` di laptop dan disinkronkan sebagai record privat (terenkripsi di mode
+e2e). Aturannya ada di `backend/docs/journal.md`.
+
+```sh
+cargo run -q --release -- journal            # 7 hari terakhir
+cargo run -q --release -- journal --days 30
+```
+
+```
+== -Volumes-SSD1-Private-snailers
+done       11-19 22:25  page untuk menambahkan jenis item berbeda [feature/collection]
+           8 prompt(s) · 116 min active · 9 file(s) · 7 commit(s)
+pending    11-19 11:09  mode offline untuk semua isian form … [fix/code-audit-improvements]
+           8 prompt(s) · 43 min active · 15 file(s) · 1 pause(s)
+```
+
+Status: `active` (berjalan), `pending` (ada perubahan belum di-commit, tanpa aktivitas lebih dari
+24 jam), `committed` (belum di-push), `done` (di-push, PR, atau selesai di luar agent),
+`abandoned`, `discarded` (perubahan dibuang). Perubahan yang belum di-commit tetap satu item
+berapa lama pun jedanya.
+
 ### `activity`
 
 Timeline per hari tentang apa yang dikerjakan agent: prompt kamu, balasan agent, dan setiap

@@ -109,6 +109,10 @@ pub fn import(store: &Store, reader: Option<&str>, path: Option<PathBuf>) -> Res
         started.elapsed().as_secs_f64()
     );
     eprintln!("stored in {}", store.usage_db_path().display());
+    let items = ingest.db.build_work_items(chrono::Utc::now())?;
+    if items > 0 {
+        eprintln!("journal: {items} work item(s) updated");
+    }
     Ok(())
 }
 

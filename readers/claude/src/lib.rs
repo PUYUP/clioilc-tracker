@@ -81,6 +81,8 @@ struct Line {
     timestamp: Option<DateTime<Utc>>,
     /// Folder the session runs in; locates git commits of shell commands.
     cwd: Option<String>,
+    /// Branch checked out in `cwd`; `HEAD` when not a repo or detached.
+    git_branch: Option<String>,
     message: Option<LineMessage>,
 }
 
@@ -168,6 +170,7 @@ impl Line {
             return Vec::new();
         };
         let cwd = self.cwd;
+        let branch = self.git_branch.filter(|b| !b.is_empty() && b != "HEAD");
         match self.kind.as_str() {
             "assistant" => {
                 let (Some(id), Some(line_id)) = (msg.id, self.uuid) else {
@@ -236,6 +239,7 @@ impl Line {
                     speed,
                     blocks,
                     tool_calls,
+                    branch,
                 })]
             }
             "user" => {
@@ -248,16 +252,20 @@ impl Line {
                                 continue;
                             };
                             let is_error = b.is_error.unwrap_or(false);
-                            let commits = if is_error {
-                                Vec::new()
+                            let (commits, prs) = if is_error {
+                                (Vec::new(), Vec::new())
                             } else {
-                                git::parse_output(&b.content.0)
+                                (
+                                    git::parse_output(&b.content.0),
+                                    git::parse_prs(&b.content.0),
+                                )
                             };
                             records.push(Record::ToolResult(ToolResult {
                                 tool_call_id,
                                 is_error,
                                 timestamp: Some(timestamp),
                                 commits,
+                                prs,
                                 error_text: is_error
                                     .then_some(b.content.0)
                                     .filter(|t| !t.is_empty()),
@@ -288,6 +296,7 @@ impl Line {
                             is_subagent: self.is_sidechain,
                             timestamp,
                             text: prompt,
+                            branch: branch.clone(),
                         }));
                     }
                 }

@@ -61,6 +61,8 @@ pub struct Syncer {
     _lock: File,
     /// E2E team sync (commands/team.rs): when it last ran, and its notes.
     last_team: Option<std::time::Instant>,
+    /// Journal work items (clioilc_core::journal): when they were last rebuilt.
+    last_journal: Option<std::time::Instant>,
     pub team_notes: Vec<String>,
     pub team_uploaded: usize,
 }
@@ -102,6 +104,7 @@ impl Syncer {
             data_dir: data_dir.to_path_buf(),
             _lock: lock,
             last_team: None,
+            last_journal: None,
             team_notes: Vec::new(),
             team_uploaded: 0,
         };
@@ -138,6 +141,10 @@ impl Syncer {
     /// team copies of linked folders.
     pub fn run(&mut self) -> Result<Totals> {
         self.db.resolve_commits()?;
+        if self.last_journal.is_none_or(|t| t.elapsed() >= TEAM_EVERY) {
+            self.last_journal = Some(std::time::Instant::now());
+            self.db.build_work_items(chrono::Utc::now())?;
+        }
         let totals = self.run_personal()?;
         self.team_uploaded = 0;
         let due = self.last_team.is_none_or(|t| t.elapsed() >= TEAM_EVERY) || totals.private > 0;
