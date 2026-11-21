@@ -72,44 +72,222 @@ pub fn parse_output(text: &str) -> Vec<Commit> {
 
 /// Folders a shell command creates commits in, following `cd <dir>` and
 /// `git -C <dir>` from `cwd`. Empty when the command runs no committing git
-/// subcommand. Heredoc bodies (commit messages) are skipped.
+/// subcommand. Understands quotes (also across lines), heredocs (commit
+/// messages), `( ... )` subshells (a `cd` inside ends at `)`), and gives up
+/// on folders it cannot know (`cd $dir`).
 pub fn commit_dirs(command: &str, cwd: Option<&str>) -> Vec<String> {
     let mut dir: Option<PathBuf> = cwd.map(PathBuf::from);
+    let mut saved: Vec<Option<PathBuf>> = Vec::new();
     let mut out: Vec<String> = Vec::new();
-    let mut heredoc: Option<String> = None;
-    for line in command.lines() {
-        if let Some(end) = &heredoc {
-            if line.trim() == end {
-                heredoc = None;
-            }
-            continue;
-        }
-        heredoc = heredoc_delimiter(line);
-        for segment in split_segments(line) {
-            let words = shell_words(segment);
-            let words: Vec<&str> = words
-                .iter()
-                .map(String::as_str)
-                .skip_while(|w| *w == "(" || *w == "{" || is_assignment(w))
-                .collect();
-            match words.first().copied() {
-                Some("cd") => {
-                    let target = words.get(1).copied().unwrap_or("~");
-                    dir = resolve_dir(dir.as_deref(), target);
-                }
-                Some(w) if w == "git" || w.ends_with("/git") => {
-                    if let Some(d) = git_target(&words[1..], dir.as_deref()) {
-                        let d = d.to_string_lossy().into_owned();
-                        if !out.contains(&d) {
-                            out.push(d);
+    for part in parse_shell(command) {
+        match part {
+            Part::Open => saved.push(dir.clone()),
+            Part::Close => dir = saved.pop().unwrap_or(dir.take()),
+            Part::Command(words) => {
+                let words: Vec<&str> = words
+                    .iter()
+                    .map(String::as_str)
+                    .skip_while(|w| KEYWORDS.contains(w) || is_assignment(w))
+                    .collect();
+                match words.first().copied() {
+                    Some("cd") => {
+                        let target = words.get(1).copied().unwrap_or("~");
+                        dir = resolve_dir(dir.as_deref(), target);
+                    }
+                    Some("pushd") => {
+                        saved.push(dir.clone());
+                        dir = words.get(1).and_then(|t| resolve_dir(dir.as_deref(), t));
+                    }
+                    Some("popd") => dir = saved.pop().unwrap_or(dir.take()),
+                    Some(w) if w == "git" || w.ends_with("/git") => {
+                        if let Some(d) = git_target(&words[1..], dir.as_deref()) {
+                            let d = d.to_string_lossy().into_owned();
+                            if !out.contains(&d) {
+                                out.push(d);
+                            }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }
     out
+}
+
+/// Words that may precede a command without being it.
+const KEYWORDS: &[&str] = &[
+    "{", "}", "do", "then", "else", "elif", "!", "time", "exec", "command",
+];
+
+#[derive(Debug, PartialEq)]
+enum Part {
+    /// One simple command, quotes removed. A word that came from `$x`,
+    /// `` `cmd` `` or `$(cmd)` keeps its `$`/backtick, so it is never
+    /// taken for a folder.
+    Command(Vec<String>),
+    /// `(`: a subshell starts.
+    Open,
+    /// `)`: it ends.
+    Close,
+}
+
+/// A small shell tokenizer: enough to follow folders, not to run anything.
+fn parse_shell(src: &str) -> Vec<Part> {
+    let chars: Vec<char> = src.chars().collect();
+    let mut parts = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut has_word = false;
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
+    fn end_word(cur: &mut String, has: &mut bool, words: &mut Vec<String>) {
+        if *has || !cur.is_empty() {
+            words.push(std::mem::take(cur));
+            *has = false;
+        }
+    }
+    fn end_command(words: &mut Vec<String>, parts: &mut Vec<Part>) {
+        if !words.is_empty() {
+            parts.push(Part::Command(std::mem::take(words)));
+        }
+    }
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\\' => {
+                // An escaped char; backslash-newline continues the line.
+                if let Some(&n) = chars.get(i + 1) {
+                    if n != '\n' {
+                        cur.push(n);
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            '\'' => {
+                has_word = true;
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    cur.push(chars[i]);
+                    i += 1;
+                }
+            }
+            '"' => {
+                has_word = true;
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        i += 1;
+                    }
+                    cur.push(chars[i]);
+                    i += 1;
+                }
+            }
+            '$' if chars.get(i + 1) == Some(&'(') => {
+                // $( ... ): kept whole, as an opaque word.
+                let mut depth = 0;
+                while i < chars.len() {
+                    cur.push(chars[i]);
+                    if chars[i] == '(' {
+                        depth += 1;
+                    } else if chars[i] == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            '`' => {
+                cur.push('`');
+                i += 1;
+                while i < chars.len() && chars[i] != '`' {
+                    cur.push(chars[i]);
+                    i += 1;
+                }
+                cur.push('`');
+            }
+            '#' if cur.is_empty() && !has_word => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            '<' if chars.get(i + 1) == Some(&'<') && chars.get(i + 2) != Some(&'<') => {
+                end_word(&mut cur, &mut has_word, &mut words);
+                i += 2;
+                let strip_tabs = chars.get(i) == Some(&'-');
+                if strip_tabs {
+                    i += 1;
+                }
+                while chars.get(i).is_some_and(|c| *c == ' ' || *c == '\t') {
+                    i += 1;
+                }
+                let mut delim = String::new();
+                while let Some(&d) = chars.get(i) {
+                    if d.is_whitespace() || ";&|()<>".contains(d) {
+                        break;
+                    }
+                    if d != '\'' && d != '"' && d != '\\' {
+                        delim.push(d);
+                    }
+                    i += 1;
+                }
+                if !delim.is_empty() {
+                    heredocs.push((delim, strip_tabs));
+                }
+                continue;
+            }
+            '\n' => {
+                end_word(&mut cur, &mut has_word, &mut words);
+                end_command(&mut words, &mut parts);
+                // Heredoc bodies start on the next line: skip them.
+                for (delim, strip_tabs) in std::mem::take(&mut heredocs) {
+                    loop {
+                        let start = i + 1;
+                        let mut j = start;
+                        while j < chars.len() && chars[j] != '\n' {
+                            j += 1;
+                        }
+                        let line: String = chars[start.min(chars.len())..j].iter().collect();
+                        i = j;
+                        let line = if strip_tabs {
+                            line.trim_start_matches('\t')
+                        } else {
+                            line.as_str()
+                        };
+                        if line == delim || j >= chars.len() {
+                            break;
+                        }
+                    }
+                }
+            }
+            ';' | '&' | '|' => {
+                end_word(&mut cur, &mut has_word, &mut words);
+                end_command(&mut words, &mut parts);
+            }
+            '(' if cur.is_empty()
+                && !has_word
+                && words.iter().all(|w| KEYWORDS.contains(&w.as_str())) =>
+            {
+                words.clear();
+                parts.push(Part::Open);
+            }
+            ')' => {
+                end_word(&mut cur, &mut has_word, &mut words);
+                end_command(&mut words, &mut parts);
+                parts.push(Part::Close);
+            }
+            c if c.is_whitespace() => end_word(&mut cur, &mut has_word, &mut words),
+            c => cur.push(c),
+        }
+        i += 1;
+    }
+    end_word(&mut cur, &mut has_word, &mut words);
+    end_command(&mut words, &mut parts);
+    parts
 }
 
 /// For `git [-C dir] [-c k=v] <subcommand> ...`: the folder, when the
@@ -132,6 +310,10 @@ fn git_target(args: &[&str], dir: Option<&Path>) -> Option<PathBuf> {
 }
 
 fn resolve_dir(base: Option<&Path>, target: &str) -> Option<PathBuf> {
+    // Variables, command output, `cd -`: unknown here.
+    if target.is_empty() || target == "-" || target.contains(['$', '`', '*', '?']) {
+        return None;
+    }
     let target = target.trim_end_matches('/');
     let path = if target == "~" || target.starts_with("~/") {
         crate::home_dir()
@@ -160,75 +342,6 @@ fn is_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(k, _)| {
         !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     })
-}
-
-/// `<<EOF`, `<<'EOF'`, `<<-"EOF"` -> `EOF`.
-fn heredoc_delimiter(line: &str) -> Option<String> {
-    let i = line.find("<<")?;
-    let rest = line[i + 2..].trim_start_matches('-').trim_start();
-    let word: String = rest
-        .trim_start_matches(['\'', '"'])
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
-    (!word.is_empty()).then_some(word)
-}
-
-/// Split one line at `&&`, `||`, `;` and `|`, outside quotes.
-fn split_segments(line: &str) -> Vec<&str> {
-    let bytes = line.as_bytes();
-    let mut out = Vec::new();
-    let (mut start, mut i, mut quote) = (0, 0, None::<u8>);
-    while i < bytes.len() {
-        let b = bytes[i];
-        match quote {
-            Some(q) if b == q => quote = None,
-            Some(_) => {}
-            None if b == b'\'' || b == b'"' => quote = Some(b),
-            None if b == b';' || b == b'|' || b == b'&' => {
-                out.push(&line[start..i]);
-                while i + 1 < bytes.len() && matches!(bytes[i + 1], b'|' | b'&') {
-                    i += 1;
-                }
-                start = i + 1;
-            }
-            None => {}
-        }
-        i += 1;
-    }
-    out.push(&line[start..]);
-    out
-}
-
-/// Words of one simple command, with quotes removed; `(` and `{` that open
-/// a subshell or group become their own words.
-fn shell_words(segment: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut cur = String::new();
-    let mut quote = None::<char>;
-    let mut has = false;
-    for c in segment.chars() {
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => cur.push(c),
-            None if c == '\'' || c == '"' => {
-                quote = Some(c);
-                has = true;
-            }
-            None if c.is_whitespace() => {
-                if has || !cur.is_empty() {
-                    words.push(std::mem::take(&mut cur));
-                    has = false;
-                }
-            }
-            None if (c == '(' || c == '{') && cur.is_empty() && !has => words.push(c.to_string()),
-            None => cur.push(c),
-        }
-    }
-    if has || !cur.is_empty() {
-        words.push(cur);
-    }
-    words
 }
 
 fn cap(subject: &str) -> String {
@@ -436,6 +549,30 @@ mod tests {
         assert_eq!(
             commit_dirs("cd \"my repo\" && git revert HEAD", cwd),
             vec!["/w/clioilc/my repo"]
+        );
+        // Subshells end their cd; quoted messages may span lines.
+        let cmd = "cd /w/clioilc; T=\"\n\nCo-Authored-By: x\"\n\
+                   (cd backend && git commit -qm \"Title\nbody (with parens)\n$T\" && git push; git log -1)\n\
+                   (cd tracker && git commit -qm \"Two$T\")";
+        assert_eq!(
+            commit_dirs(cmd, Some("/w/clioilc/frontend")),
+            vec!["/w/clioilc/backend", "/w/clioilc/tracker"]
+        );
+        // Unknown folders are skipped, not guessed.
+        assert_eq!(
+            commit_dirs(
+                "for r in a b; do (cd $r; git commit -qm x); done; git -C $(pwd)/x commit",
+                cwd
+            ),
+            Vec::<String>::new()
+        );
+        // Line continuation, comments, pushd/popd.
+        assert_eq!(
+            commit_dirs(
+                "# commit it\npushd api && git \\\n  commit -m 'x'; popd\ngit merge dev",
+                cwd
+            ),
+            vec!["/w/clioilc/api", "/w/clioilc"]
         );
         // Relative folders without a known cwd cannot be placed.
         assert_eq!(commit_dirs("git commit -m x", None), Vec::<String>::new());

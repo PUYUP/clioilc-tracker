@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS private_tool_calls (
     commits   TEXT,                   -- JSON list of {hash, branch, subject, remote}
     -- local only, to find commits: folders, end time, done flag
     git_dirs  TEXT,                   -- JSON list of repository folders
+    printed   TEXT,                   -- JSON commits as the tool output printed them
     result_ts TEXT,
     commits_checked INTEGER NOT NULL DEFAULT 0
 );
@@ -370,7 +371,7 @@ impl UsageDb {
                 // Local only: no re-sync. Backfilled by a later `usage import`.
                 self.conn
                     .prepare_cached(
-                        "UPDATE private_tool_calls SET git_dirs = ?2
+                        "UPDATE private_tool_calls SET git_dirs = ?2, commits_checked = 0
                          WHERE id = ?1 AND git_dirs IS NULL",
                     )?
                     .execute(params![call_id, serde_json::to_string(&call.git_dirs)?])?;
@@ -408,12 +409,18 @@ impl UsageDb {
                     ..c.clone()
                 })
                 .collect();
+            let json = serde_json::to_string(&commits)?;
+            self.conn
+                .prepare_cached(
+                    "UPDATE private_tool_calls SET printed = ?2 WHERE id = ?1 AND printed IS NULL",
+                )?
+                .execute(params![id, json])?;
             self.conn
                 .prepare_cached(
                     "UPDATE private_tool_calls SET commits = ?2, synced_at = NULL
                      WHERE id = ?1 AND commits IS NULL",
                 )?
-                .execute(params![id, serde_json::to_string(&commits)?])?;
+                .execute(params![id, json])?;
         }
         Ok(())
     }
@@ -425,7 +432,7 @@ impl UsageDb {
         self.commit()?;
         let pending: Vec<PendingCommits> = {
             let mut stmt = self.conn.prepare(
-                "SELECT p.id, p.ts, p.result_ts, p.git_dirs, p.commits, t.status
+                "SELECT p.id, p.ts, p.result_ts, p.git_dirs, p.commits, t.status, p.printed
                  FROM private_tool_calls p JOIN tool_calls t ON t.id = p.id
                  WHERE p.git_dirs IS NOT NULL AND p.commits_checked = 0
                    AND t.status IS NOT NULL",
@@ -438,6 +445,7 @@ impl UsageDb {
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             })?;
             rows.collect::<rusqlite::Result<_>>()?
@@ -448,8 +456,9 @@ impl UsageDb {
                 .map(|t| t.timestamp())
         };
         let mut found = 0;
-        for (id, ts, result_ts, dirs, current, status) in pending {
-            let printed = parse_commits(current.clone());
+        for (id, ts, result_ts, dirs, current, status, printed) in pending {
+            // What the output printed, not an earlier lookup: that may be redone.
+            let printed = parse_commits(printed);
             let commits = match (status.as_deref(), epoch(&ts)) {
                 (Some("ok"), Some(from)) => {
                     let dirs: Vec<String> = serde_json::from_str(&dirs).unwrap_or_default();
@@ -1079,9 +1088,37 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
         "commits_checked",
         "INTEGER NOT NULL DEFAULT 0",
     ),
+    ("private_tool_calls", "printed", "TEXT"),
 ];
 
+/// Version of `git::commit_dirs`. When it changes, the folders of earlier
+/// shell commands are worked out again on the next `usage import`.
+const GIT_DIRS_VERSION: i64 = 2;
+
 fn migrate(conn: &Connection) -> Result<()> {
+    migrate_columns(conn)?;
+    let version: i64 = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'git_dirs_version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    if version < GIT_DIRS_VERSION {
+        conn.execute_batch(
+            "UPDATE private_tool_calls SET git_dirs = NULL, commits_checked = 0
+             WHERE git_dirs IS NOT NULL",
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('git_dirs_version', ?1)",
+            [GIT_DIRS_VERSION],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_columns(conn: &Connection) -> Result<()> {
     for (table, column, kind) in MIGRATIONS {
         let exists: bool = conn.query_row(
             &format!("SELECT EXISTS (SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1)"),
@@ -1096,12 +1133,13 @@ fn migrate(conn: &Connection) -> Result<()> {
 }
 
 /// A finished shell command waiting for its commits to be looked up:
-/// (id, start, end, git_dirs JSON, commits JSON, status).
+/// (id, start, end, git_dirs JSON, commits JSON, status, printed JSON).
 type PendingCommits = (
     String,
     Option<String>,
     Option<String>,
     String,
+    Option<String>,
     Option<String>,
     Option<String>,
 );

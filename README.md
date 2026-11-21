@@ -236,6 +236,9 @@ cara:
   perintah itu menjalankan git. Folder itu diikuti dari `cd <folder>` dan `git -C <folder>`.
   Hanya commit yang dibuat dalam rentang waktu aksi tool itu yang diambil.
 
+Folder yang hanya diketahui saat perintah berjalan (`cd $dir`, `git -C $1` di dalam fungsi
+shell) tidak ditebak: commit seperti itu hanya tercatat kalau hash-nya tercetak di output.
+
 Riwayat lama ikut terisi setelah `usage import`, selama repo-nya masih ada di laptop. Kalau
 repo-nya sudah tidak ada, hash yang tercetak tetap disimpan apa adanya.
 
