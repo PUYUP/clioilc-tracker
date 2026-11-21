@@ -41,6 +41,10 @@ pub struct Commit {
     /// paths relative to the repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changes: Vec<FileChange>,
+    /// The repository's folder on this machine: `changes` paths are relative
+    /// to it, so edits (absolute paths) can be matched to commits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
 }
 
 /// At most this many changed files are kept per commit (`files` has the total).
@@ -91,6 +95,7 @@ fn with_stats(mut c: Commit, dir: &str) -> Commit {
     if let Some((files, ins, del, changes)) = numstat(dir, &c.hash) {
         (c.files, c.insertions, c.deletions) = (Some(files), Some(ins), Some(del));
         c.changes = changes;
+        c.root = git(dir, &["rev-parse", "--show-toplevel"]);
     }
     c
 }
@@ -129,6 +134,7 @@ pub fn parse_output(text: &str) -> Vec<Commit> {
             insertions: None,
             deletions: None,
             changes: Vec::new(),
+            root: None,
         });
         if out.len() == MAX_COMMITS {
             break;
@@ -532,6 +538,7 @@ pub fn resolve(printed: &[Commit], dirs: &[String], from: i64, to: i64) -> Vec<C
                 insertions: None,
                 deletions: None,
                 changes: Vec::new(),
+                root: None,
             };
             out.push(with_stats(c, dir));
         }
@@ -736,6 +743,10 @@ mod tests {
         assert_eq!(found[1].hash, head);
         assert_eq!(found[1].branch.as_deref(), Some("main"));
         assert_eq!(found[1].remote.as_deref(), Some("github.com/acme/pay"));
+        assert!(found[1]
+            .root
+            .as_deref()
+            .is_some_and(|r| r.ends_with(&format!("clioilc-git-{}", std::process::id()))));
         assert_eq!(
             found[1].changes,
             vec![FileChange {

@@ -1213,7 +1213,7 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
 
 /// Version of `git::commit_dirs`. When it changes, the folders of earlier
 /// shell commands are worked out again on the next `usage import`.
-const GIT_DIRS_VERSION: i64 = 4;
+const GIT_DIRS_VERSION: i64 = 5;
 
 fn migrate(conn: &Connection) -> Result<()> {
     migrate_columns(conn)?;

@@ -898,6 +898,7 @@ mod tests {
                     insertions: None,
                     deletions: None,
                     changes: Vec::new(),
+                    root: None,
                 })
                 .collect(),
             prs: Vec::new(),
