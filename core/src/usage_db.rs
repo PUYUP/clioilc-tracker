@@ -1217,6 +1217,23 @@ const GIT_DIRS_VERSION: i64 = 3;
 
 fn migrate(conn: &Connection) -> Result<()> {
     migrate_columns(conn)?;
+    // Servers before 2026-11-21 dropped commit sizes (files, insertions,
+    // deletions) of server-mode accounts: send the rows carrying them again,
+    // once (uploads are idempotent).
+    let resent: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'commit_stats_resent'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if resent.is_none() {
+        conn.execute_batch(
+            "UPDATE private_tool_calls SET synced_at = NULL WHERE commits IS NOT NULL;
+             UPDATE work_items SET synced_at = NULL;
+             INSERT OR REPLACE INTO meta (key, value) VALUES ('commit_stats_resent', x'01');",
+        )?;
+    }
     let version: i64 = conn
         .query_row(
             "SELECT value FROM meta WHERE key = 'git_dirs_version'",
