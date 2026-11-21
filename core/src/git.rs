@@ -37,31 +37,60 @@ pub struct Commit {
     pub insertions: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletions: Option<u32>,
+    /// The files it changed (at most [`MAX_CHANGED_FILES`], biggest first),
+    /// paths relative to the repository.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<FileChange>,
+}
+
+/// At most this many changed files are kept per commit (`files` has the total).
+pub const MAX_CHANGED_FILES: usize = 50;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChange {
+    pub path: String,
+    /// None for binary files (git shows no line counts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insertions: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<u32>,
 }
 
 /// Files changed, lines added and removed by one commit (binary files
 /// count as changed files without lines).
-fn numstat(dir: &str, hash: &str) -> Option<(u32, u32, u32)> {
+fn numstat(dir: &str, hash: &str) -> Option<(u32, u32, u32, Vec<FileChange>)> {
     let out = git(
         dir,
-        &["show", "--numstat", "--format=", "--no-renames", hash],
+        &["show", "--numstat", "--format=", "--no-renames", "-z", hash],
     )?;
     let (mut files, mut ins, mut del) = (0u32, 0u32, 0u32);
-    for line in out.lines() {
-        let mut f = line.split('\t');
-        let (Some(a), Some(d)) = (f.next(), f.next()) else {
+    let mut changes = Vec::new();
+    // -z: `<added>\t<deleted>\t<path>\0`, so paths with tabs or newlines stay whole.
+    for entry in out.split('\0') {
+        let mut f = entry.trim_start_matches('\n').splitn(3, '\t');
+        let (Some(a), Some(d), Some(path)) = (f.next(), f.next(), f.next()) else {
             continue;
         };
+        let (a, d) = (a.parse::<u32>().ok(), d.parse::<u32>().ok());
         files += 1;
-        ins = ins.saturating_add(a.parse().unwrap_or(0));
-        del = del.saturating_add(d.parse().unwrap_or(0));
+        ins = ins.saturating_add(a.unwrap_or(0));
+        del = del.saturating_add(d.unwrap_or(0));
+        changes.push(FileChange {
+            path: path.to_string(),
+            insertions: a,
+            deletions: d,
+        });
     }
-    Some((files, ins, del))
+    let size = |c: &FileChange| c.insertions.unwrap_or(0) + c.deletions.unwrap_or(0);
+    changes.sort_by(|x, y| size(y).cmp(&size(x)).then(x.path.cmp(&y.path)));
+    changes.truncate(MAX_CHANGED_FILES);
+    Some((files, ins, del, changes))
 }
 
 fn with_stats(mut c: Commit, dir: &str) -> Commit {
-    if let Some((files, ins, del)) = numstat(dir, &c.hash) {
+    if let Some((files, ins, del, changes)) = numstat(dir, &c.hash) {
         (c.files, c.insertions, c.deletions) = (Some(files), Some(ins), Some(del));
+        c.changes = changes;
     }
     c
 }
@@ -99,6 +128,7 @@ pub fn parse_output(text: &str) -> Vec<Commit> {
             files: None,
             insertions: None,
             deletions: None,
+            changes: Vec::new(),
         });
         if out.len() == MAX_COMMITS {
             break;
@@ -501,6 +531,7 @@ pub fn resolve(printed: &[Commit], dirs: &[String], from: i64, to: i64) -> Vec<C
                 files: None,
                 insertions: None,
                 deletions: None,
+                changes: Vec::new(),
             };
             out.push(with_stats(c, dir));
         }
@@ -705,6 +736,14 @@ mod tests {
         assert_eq!(found[1].hash, head);
         assert_eq!(found[1].branch.as_deref(), Some("main"));
         assert_eq!(found[1].remote.as_deref(), Some("github.com/acme/pay"));
+        assert_eq!(
+            found[1].changes,
+            vec![FileChange {
+                path: "a.txt".into(),
+                insertions: Some(2),
+                deletions: Some(0)
+            }]
+        );
         assert_eq!(
             (found[1].files, found[1].insertions, found[1].deletions),
             (Some(1), Some(2), Some(0))

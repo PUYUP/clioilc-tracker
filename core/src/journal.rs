@@ -897,6 +897,7 @@ mod tests {
                     files: None,
                     insertions: None,
                     deletions: None,
+                    changes: Vec::new(),
                 })
                 .collect(),
             prs: Vec::new(),
