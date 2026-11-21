@@ -321,6 +321,11 @@ Mode enkripsi:
 
 Untuk skrip atau CI, passphrase bisa diberikan lewat `CLIOILC_PASSPHRASE`.
 
+**Tanpa passphrase (akun e2e).** `clioilc login` mencetak *Key check*. Di halaman persetujuan di
+browser, kalau key check yang tampil sama persis, centang konfirmasinya, lalu buka dengan passkey
+atau passphrase di browser. Browser lalu mengirim data key ke mesin ini, terenkripsi untuk kunci
+sementara milik CLI (server hanya meneruskan), sehingga terminal tidak meminta passphrase.
+
 **`sync`**:
 
 - Mengirim batch berisi 500 baris sampai tidak ada yang tersisa.

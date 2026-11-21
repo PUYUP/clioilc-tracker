@@ -9,6 +9,7 @@
 use crate::cloud::auth::{self, Auth};
 use crate::cloud::client::{api_error_of, Client};
 use crate::cloud::e2e::{self, Kdf};
+use crate::cloud::handoff;
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use clap::ValueEnum;
@@ -55,6 +56,15 @@ struct Start {
 struct Token {
     access_token: String,
     device: Device,
+    /// E2E accounts: the data key, sealed by the approving browser to this
+    /// login's one-time key (cloud::handoff).
+    e2e_dek: Option<SealedKey>,
+}
+
+#[derive(Deserialize)]
+struct SealedKey {
+    enc: String,
+    ct: String,
 }
 
 #[derive(Deserialize)]
@@ -87,10 +97,19 @@ pub fn login(store: &Store, opts: Options) -> Result<()> {
     let name = opts.name.unwrap_or_else(default_device_name);
 
     let anon = Client::new(&server, None)?;
-    let start: Start = anon.post("/api/v1/devices/authorize/", &json!({ "name": name }))?;
+    // End-to-end accounts: lets the approving browser hand this machine the
+    // data key, so no passphrase is typed here.
+    let receiver = handoff::Receiver::new()?;
+    let start: Start = anon.post(
+        "/api/v1/devices/authorize/",
+        &json!({ "name": name, "e2e_pubkey": B64.encode(receiver.public) }),
+    )?;
     eprintln!();
-    eprintln!("  Open:  {}", start.verification_uri);
-    eprintln!("  Code:  {}", start.user_code);
+    eprintln!("  Open:       {}", start.verification_uri);
+    eprintln!("  Code:       {}", start.user_code);
+    eprintln!("  Key check:  {}", handoff::key_check(&receiver.public));
+    eprintln!("              (end-to-end accounts: if the browser shows the same, it can");
+    eprintln!("              unlock this machine for you and no passphrase is asked here)");
     eprintln!();
     if !opts.no_browser && io::stderr().is_terminal() {
         open_browser(&start.verification_uri_complete);
@@ -102,7 +121,16 @@ pub fn login(store: &Store, opts: Options) -> Result<()> {
     let result = (|| {
         let me: Me = client.get("/api/v1/users/me/")?;
         eprintln!("approved: {} as \"{}\"", me.username, token.device.name);
-        let (enc_mode, data_key, salt) = setup_keyring(&client, store, opts.mode)?;
+        let handed = match &token.e2e_dek {
+            Some(k) => {
+                let key =
+                    receiver.open(&B64.decode(&k.enc)?, &B64.decode(&k.ct)?, &start.user_code)?;
+                eprintln!("received the data key from the browser");
+                Some(key)
+            }
+            None => None,
+        };
+        let (enc_mode, data_key, salt) = setup_keyring(&client, store, opts.mode, handed)?;
         apply_salt(store, &salt, opts.yes)?;
         Ok(Auth {
             server: server.trim_end_matches('/').to_string(),
@@ -226,6 +254,7 @@ fn setup_keyring(
     client: &Client,
     store: &Store,
     mode: Option<Mode>,
+    handed: Option<[u8; 32]>,
 ) -> Result<(String, Option<[u8; 32]>, Vec<u8>)> {
     match client.get::<Keyring>("/api/v1/users/keyring/") {
         Ok(ring) => {
@@ -236,6 +265,16 @@ fn setup_keyring(
                         "note: this account already uses {}; --mode is ignored",
                         mode_label(&ring.enc_mode)
                     );
+                }
+            }
+            if let (Some(dek), "e2e") = (handed, ring.enc_mode.as_str()) {
+                // The key must open this account's salt: else it is not this account's.
+                let sealed_salt = B64.decode(&ring.salt).context("keyring salt")?;
+                match e2e::open(&dek, &sealed_salt, e2e::AAD_SALT) {
+                    Ok(salt) => return Ok(("e2e".into(), Some(dek), salt)),
+                    Err(_) => eprintln!(
+                        "the key from the browser does not fit this account; using the passphrase"
+                    ),
                 }
             }
             unlock(&ring)
