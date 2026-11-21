@@ -32,6 +32,9 @@ const ACTIVE_GAP_SECS: i64 = 15 * 60;
 /// Open items are checked against the repository only after this long idle,
 /// so work in progress is never second-guessed.
 const REPO_CHECK_AFTER_SECS: i64 = 3600;
+/// Committed items not known to be pushed are checked against the remote
+/// branches while their last activity is this recent.
+const PUSH_CHECK_WITHIN_SECS: i64 = 14 * 24 * 3600;
 
 const EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 const MAX_FILES: usize = 50;
@@ -783,42 +786,51 @@ impl UsageDb {
     }
 }
 
-/// For an open item idle for a while: did the work end outside the agent?
-/// New commits on its branch -> done outside; edited files clean and no new
-/// commits -> discarded; commits already on a remote -> pushed.
+/// Run git in `repo`; its output when it succeeds.
+fn git_in(repo: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Facts the repository knows better than the agent's log:
+///
+/// - commits already on a remote branch -> pushed. Checked right away: a
+///   push is not always seen in the log (a long command is stored cut short,
+///   or the push was made in a terminal);
+/// - for an open item idle for a while, did the work end outside the agent?
+///   New commits on its branch -> done outside; edited files clean and no
+///   new commits -> discarded.
 fn check_repository(item: &mut WorkItem, now: i64) {
     let Some(last) = epoch(&item.last_activity) else {
         return;
     };
-    if now - last < REPO_CHECK_AFTER_SECS {
-        return;
-    }
-    let Some(repo) = item.files.iter().find_map(|f| repo_of(&f.path)) else {
-        return;
-    };
-    let git = |args: &[&str]| -> Option<String> {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(args)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-    };
-    if item.committed && !item.pushed {
-        if let Some(last_commit) = item.commits.last() {
-            let remote = git(&["branch", "-r", "--contains", &last_commit.hash]);
+    if item.committed && !item.pushed && now - last < PUSH_CHECK_WITHIN_SECS {
+        if let Some(c) = item.commits.last() {
+            let repo = c
+                .root
+                .clone()
+                .or_else(|| item.files.iter().find_map(|f| repo_of(&f.path)));
+            let remote = repo.and_then(|r| git_in(&r, &["branch", "-r", "--contains", &c.hash]));
             if remote.is_some_and(|r| !r.is_empty()) {
                 item.pushed = true;
             }
         }
     }
-    if item.state != "open" || !item.pending_edits {
+    if now - last < REPO_CHECK_AFTER_SECS || item.state != "open" || !item.pending_edits {
         return;
     }
+    let Some(repo) = item.files.iter().find_map(|f| repo_of(&f.path)) else {
+        return;
+    };
+    let git = |args: &[&str]| git_in(&repo, args);
     // Commits on any branch touching the edited files since: the work was
     // committed outside the agent, or carried to another branch.
     let since = format!("--since=@{last}");
@@ -1083,6 +1095,66 @@ mod tests {
             (120, tool("Bash", "git commit -qm x", &["aaaaaaa"])),
         ]);
         assert_eq!(got[0].title.as_deref(), Some("subject aaaaaaa"));
+    }
+
+    #[test]
+    fn a_push_the_log_did_not_show_is_found_on_the_remote() {
+        let dir = std::env::temp_dir().join(format!("clioilc-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (repo, remote) = (dir.join("repo"), dir.join("remote.git"));
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&dir, &["init", "-q", "--bare", "remote.git"]);
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ],
+        );
+        let hash = run(&repo, &["rev-parse", "HEAD"]);
+        run(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+
+        // The command that pushed was stored cut short: no push in the log.
+        let mut w = items(vec![
+            (0, prompt("a", Some("main"))),
+            (
+                60,
+                tool("Bash", "git commit -m 'long…[truncated]", &[&hash]),
+            ),
+        ])
+        .remove(0);
+        w.commits[0].root = Some(repo.to_string_lossy().into());
+        let now = 120;
+        check_repository(&mut w, now);
+        assert!(w.committed && !w.pushed, "not pushed yet");
+        run(&repo, &["push", "-q", "origin", "main"]);
+        check_repository(&mut w, now);
+        assert!(w.pushed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
