@@ -352,6 +352,19 @@ dengan kunci proyek, dan server hanya menyimpan ciphertext.
   setiap 5 menit, atau segera ada data privat baru). Yang dibagikan: aksi tool, ditambah
   prompt dan balasan kalau berbagi teks dinyalakan untuk proyek itu, mulai dari `share_from`.
   `project_id` di dalamnya diganti dengan id proyek tim.
+- **Berbagi teks butuh konfirmasi di laptop ini.** Prompt, balasan, dan thinking hanya
+  dikirim kalau berbagi teks menyala di dashboard **dan** dikonfirmasi di sini, supaya server
+  tidak bisa menyalakannya diam-diam:
+
+  ```bash
+  ./target/release/clioilc team share acme/api on    # nyalakan (di sini dan di web)
+  ./target/release/clioilc team share acme/api       # status: web dan laptop ini
+  ./target/release/clioilc team share acme/api off   # matikan; salinan teks di tim dihapus
+  ./target/release/clioilc team share                # daftar proyek yang dikonfirmasi
+  ```
+
+  Izinnya disimpan di `~/.clioilc/share.json` (0600). Mematikan di web atau di laptop
+  langsung menghentikan pengiriman teks.
 - Selama kunci proyek **perlu dirotasi** (ada anggota yang keluar), unggahan untuk proyek itu
   ditahan sampai pengelola memasang versi baru. Datanya tetap aman di laptop.
 

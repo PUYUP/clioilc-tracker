@@ -7,12 +7,13 @@
 //! after comparing fingerprints out of band (`clioilc team`).
 
 use super::login::confirm;
+use crate::cloud::auth;
 use crate::cloud::client::{api_error_of, Client};
 use crate::cloud::e2e::{self, KEY_LEN};
 use crate::cloud::e2e_v2::{self as v2, GrantFields, Identity};
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use clioilc_core::UsageDb;
+use clioilc_core::{Store, UsageDb};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -87,27 +88,94 @@ pub struct Pin {
 pub struct Pins(BTreeMap<u64, Pin>);
 
 impl Pins {
-    fn path(data_dir: &Path) -> PathBuf {
-        data_dir.join("pins.json")
-    }
-
     pub fn load(data_dir: &Path) -> Result<Self> {
-        match std::fs::read(Self::path(data_dir)) {
-            Ok(raw) => Ok(serde_json::from_slice(&raw).context("reading pins.json")?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e.into()),
-        }
+        load_private(data_dir, "pins.json")
     }
 
     pub fn save(&self, data_dir: &Path) -> Result<()> {
-        let path = Self::path(data_dir);
-        std::fs::write(&path, serde_json::to_vec_pretty(self)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
+        save_private(data_dir, "pins.json", self)
+    }
+}
+
+/// A JSON file in the data dir, or the default when it does not exist yet.
+fn load_private<T: for<'de> Deserialize<'de> + Default>(data_dir: &Path, name: &str) -> Result<T> {
+    match std::fs::read(data_dir.join(name)) {
+        Ok(raw) => serde_json::from_slice(&raw).with_context(|| format!("reading {name}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Write a JSON file readable only by this user (0600 on unix).
+fn save_private(data_dir: &Path, name: &str, value: &impl Serialize) -> Result<()> {
+    let path: PathBuf = data_dir.join(name);
+    std::fs::write(&path, serde_json::to_vec_pretty(value)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+// --- text sharing confirmed on this machine ---------------------------------------------
+
+/// One project's text-sharing choice made on this machine.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ShareChoice {
+    /// `workspace/project` when the choice was made (for display only).
+    pub target: String,
+    pub on: bool,
+    pub at: String,
+}
+
+/// Projects whose prompts, replies and thinking this machine may send to an
+/// E2E team, by project id (`share.json`, 0600). The server's `share_text`
+/// flag alone never makes team sync send text: a compromised server could
+/// set it. Both must be on; either one off stops it.
+#[derive(Serialize, Deserialize, Default)]
+pub struct Shares(BTreeMap<u64, ShareChoice>);
+
+impl Shares {
+    pub fn load(data_dir: &Path) -> Result<Self> {
+        load_private(data_dir, "share.json")
+    }
+
+    pub fn save(&self, data_dir: &Path) -> Result<()> {
+        save_private(data_dir, "share.json", self)
+    }
+
+    pub fn allows(&self, project_id: u64) -> bool {
+        self.0.get(&project_id).is_some_and(|c| c.on)
+    }
+
+    pub fn set(&mut self, project_id: u64, target: &str, on: bool) {
+        self.0.insert(
+            project_id,
+            ShareChoice {
+                target: target.to_string(),
+                on,
+                at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+    }
+}
+
+/// Text goes to the team only when the server flag and this machine's
+/// confirmation are both on. The note says what to do when only the web
+/// side is on.
+fn text_allowed(server: bool, local: bool, label: &str) -> (bool, Option<String>) {
+    match (server, local) {
+        (true, true) => (true, None),
+        (true, false) => (
+            false,
+            Some(format!(
+                "{label}: text sharing is on on the web but not confirmed on this machine; \
+                 only usage and tool actions are sent. To share prompts and replies from \
+                 here: clioilc team share {label} on"
+            )),
+        ),
+        _ => (false, None),
     }
 }
 
@@ -213,6 +281,7 @@ pub fn sync(
         ));
     }
     let pins = Pins::load(data_dir)?;
+    let shares = Shares::load(data_dir)?;
     let my_ed = ident.ed25519_public();
 
     let mut by_ws: BTreeMap<String, Vec<Link>> = BTreeMap::new();
@@ -264,7 +333,9 @@ pub fn sync(
                 "/api/v1/workspaces/{ws}/projects/{}/me/",
                 proj.slug
             ))?;
-            let text = settings["share_text"].as_bool().unwrap_or(false);
+            let server_text = settings["share_text"].as_bool().unwrap_or(false);
+            let (text, note) = text_allowed(server_text, shares.allows(project_id), &label);
+            report.notes.extend(note);
             report.uploaded += upload(client, db, &ws, proj, &links, &key, me.id, text)?;
         }
     }
@@ -498,6 +569,80 @@ pub fn run(client: &Client, db: &mut UsageDb, dek: &[u8; KEY_LEN], data_dir: &Pa
     Ok(())
 }
 
+// --- `clioilc team share` ------------------------------------------------------------------
+
+/// `clioilc team share [<workspace>/<project> [on|off]]`: list, show or set
+/// whether this machine sends the prompts, replies and thinking of linked
+/// folders to a team project. Setting it also updates the web setting, so
+/// both sides agree; off on either side stops it.
+pub fn share(store: &Store, target: Option<&str>, on: Option<bool>) -> Result<()> {
+    let data_dir = store.data_dir();
+    let mut shares = Shares::load(data_dir)?;
+    let Some(target) = target else {
+        if shares.0.values().all(|c| !c.on) {
+            println!("this machine shares no text with team projects");
+        }
+        for c in shares.0.values().filter(|c| c.on) {
+            println!("{}: text sharing confirmed {}", c.target, &c.at[..10]);
+        }
+        return Ok(());
+    };
+    let (ws, project) = super::link::split_target(target)?;
+    let auth = auth::require(data_dir)?;
+    let client = Client::new(&auth.server, Some(&auth.token))?;
+    let url = format!("/api/v1/workspaces/{ws}/projects/{project}/me/");
+    let current: MemberSettings = client.get(&url)?;
+    let e2e = current.enc_mode == "e2e";
+    let Some(on) = on else {
+        let web = if current.share_text { "on" } else { "off" };
+        if e2e {
+            let here = if shares.allows(current.project_id) {
+                "on"
+            } else {
+                "off"
+            };
+            println!("{target}: text sharing on the web {web}, on this machine {here}");
+            if current.share_text != shares.allows(current.project_id) {
+                println!("(prompts and replies are sent only when both are on)");
+            }
+        } else {
+            println!("{target}: text sharing {web}");
+        }
+        return Ok(());
+    };
+    if e2e {
+        // Local first: off stops here even if the server call fails, and on
+        // without the server flag still sends nothing.
+        shares.set(current.project_id, target, on);
+        shares.save(data_dir)?;
+    }
+    let saved: MemberSettings = client.patch(&url, &json!({ "share_text": on }))?;
+    match (on, e2e) {
+        (true, true) => println!(
+            "{target}: this machine will share the prompts, replies and thinking of linked \
+             folders with the project's members, encrypted (the server cannot read them)"
+        ),
+        (true, false) => println!(
+            "{target}: your prompts, replies and thinking are shared with the project's members"
+        ),
+        (false, true) => {
+            println!("{target}: text sharing off; copies already shared were removed from the team")
+        }
+        (false, false) => println!("{target}: text sharing off"),
+    }
+    if saved.share_text != on {
+        bail!("the server did not save the setting");
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct MemberSettings {
+    share_text: bool,
+    project_id: u64,
+    enc_mode: String,
+}
+
 fn hex32(s: &str) -> Result<[u8; 32]> {
     let bytes: Vec<u8> = (0..s.len())
         .step_by(2)
@@ -565,6 +710,41 @@ mod tests {
             trust(&pins, &me, &mine, 2, &row("ann", &[3; 32], "cc")),
             Trust::Changed
         );
+    }
+
+    #[test]
+    fn text_needs_the_web_and_this_machine() {
+        assert_eq!(text_allowed(true, true, "a/b"), (true, None));
+        let (text, note) = text_allowed(true, false, "a/b");
+        assert!(!text);
+        assert!(note.unwrap().contains("clioilc team share a/b on"));
+        assert_eq!(text_allowed(false, true, "a/b"), (false, None));
+        assert_eq!(text_allowed(false, false, "a/b"), (false, None));
+    }
+
+    #[test]
+    fn share_choices_round_trip_privately() {
+        let dir = std::env::temp_dir().join(format!("clioilc-share-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut shares = Shares::load(&dir).unwrap();
+        assert!(!shares.allows(7));
+        shares.set(7, "acme/api", true);
+        shares.set(8, "acme/web", false);
+        shares.save(&dir).unwrap();
+        let back = Shares::load(&dir).unwrap();
+        assert!(back.allows(7));
+        assert!(!back.allows(8));
+        assert!(!back.allows(9));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("share.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

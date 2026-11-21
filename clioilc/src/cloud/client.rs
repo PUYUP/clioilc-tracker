@@ -81,6 +81,17 @@ impl Client {
         decode(resp, path)
     }
 
+    pub fn patch<T: DeserializeOwned>(&self, path: &str, body: &impl Serialize) -> Result<T> {
+        let mut req = self.agent.patch(format!("{}{path}", self.base));
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        let resp = req
+            .send_json(body)
+            .with_context(|| format!("PATCH {path}"))?;
+        decode(resp, path)
+    }
+
     pub fn delete(&self, path: &str) -> Result<()> {
         let mut req = self.agent.delete(format!("{}{path}", self.base));
         if let Some(token) = &self.token {

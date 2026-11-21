@@ -85,7 +85,10 @@ enum Commands {
     Links,
     /// End-to-end team workspaces: your fingerprint, verify teammates who gave
     /// you keys, then share linked folders now
-    Team,
+    Team {
+        #[command(subcommand)]
+        command: Option<TeamCommands>,
+    },
     /// Stop sharing this folder with its team project
     Unlink {
         /// Folder to unlink (default: the current folder)
@@ -137,6 +140,24 @@ enum Commands {
         #[command(subcommand)]
         command: AddCommands,
     },
+}
+
+#[derive(Subcommand)]
+enum TeamCommands {
+    /// Confirm on this machine whether to share prompts, replies and thinking
+    /// with a team project (no arguments: list; no on/off: show)
+    Share {
+        /// Team project, e.g. acme/api
+        target: Option<String>,
+        #[arg(value_enum, requires = "target")]
+        state: Option<Toggle>,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Toggle {
+    On,
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -262,7 +283,16 @@ fn main() -> Result<()> {
             },
         ),
         Commands::Links => commands::link::links(&open_store(data_dir)?),
-        Commands::Team => commands::sync::Syncer::open(&open_store(data_dir)?)?.team(),
+        Commands::Team { command: None } => {
+            commands::sync::Syncer::open(&open_store(data_dir)?)?.team()
+        }
+        Commands::Team {
+            command: Some(TeamCommands::Share { target, state }),
+        } => commands::team::share(
+            &open_store(data_dir)?,
+            target.as_deref(),
+            state.map(|t| matches!(t, Toggle::On)),
+        ),
         Commands::Unlink { path } => commands::link::unlink(&open_store(data_dir)?, path),
         Commands::Sync => commands::sync::run(&open_store(data_dir)?),
         Commands::Service { command } => {

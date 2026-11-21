@@ -241,7 +241,7 @@ fn find_target(client: &Client, dir: &Path, store: &Store) -> Result<String> {
     }
 }
 
-fn split_target(target: &str) -> Result<(&str, &str)> {
+pub(crate) fn split_target(target: &str) -> Result<(&str, &str)> {
     match target.split_once('/') {
         Some((ws, p)) if !ws.is_empty() && !p.is_empty() && !p.contains('/') => Ok((ws, p)),
         _ => bail!("expected <workspace>/<project>, e.g. acme/api"),
