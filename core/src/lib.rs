@@ -10,7 +10,7 @@ pub mod usage_db;
 pub mod watcher;
 
 pub use filter::EventFilter;
-pub use reader::Reader;
+pub use reader::{DatabaseSource, Reader};
 pub use store::{EventKind, EventLog, EventWriter, Store, TrackedEvent};
 pub use usage::Record;
 pub use usage_db::UsageDb;

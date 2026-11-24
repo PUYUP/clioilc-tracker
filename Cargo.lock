@@ -358,6 +358,7 @@ dependencies = [
  "clap",
  "clioilc-claude",
  "clioilc-core",
+ "clioilc-devin",
  "clioilc-gemini",
  "ctrlc",
  "ed25519-dalek",
@@ -396,6 +397,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "clioilc-devin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clioilc-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

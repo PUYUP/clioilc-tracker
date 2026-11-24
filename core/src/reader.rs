@@ -27,6 +27,12 @@ pub trait Reader {
         Vec::new()
     }
 
+    /// Tools that keep their history in a database instead of append-only
+    /// logs (e.g. Devin's SQLite file): how to read it. `None` for log readers.
+    fn database(&self) -> Option<&dyn DatabaseSource> {
+        None
+    }
+
     fn is_tracked(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|e| e.to_str())
@@ -36,6 +42,22 @@ pub trait Reader {
                     .any(|t| t.eq_ignore_ascii_case(ext))
             })
     }
+}
+
+/// A tool history kept in a database: read the rows added after a cursor.
+pub trait DatabaseSource {
+    /// The database file, e.g. `~/.local/share/devin/cli/sessions.db`.
+    fn path(&self) -> Result<PathBuf>;
+
+    /// Records from rows after `cursor` (0 = from the start), each with its
+    /// project name, oldest first; returns the new cursor. Must open the
+    /// database read-only: it belongs to the tool.
+    fn read_since(
+        &self,
+        path: &Path,
+        cursor: i64,
+        out: &mut dyn FnMut(Option<&str>, Record),
+    ) -> Result<i64>;
 }
 
 #[cfg(test)]

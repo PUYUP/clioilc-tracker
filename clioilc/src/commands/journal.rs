@@ -4,8 +4,18 @@ use anyhow::Result;
 use chrono::{Duration, Local, Utc};
 use clioilc_core::journal;
 use clioilc_core::{Store, UsageDb};
+use std::io::{self, Write};
 
 pub fn run(store: &Store, days: i64) -> Result<()> {
+    super::ignore_closed_stdout(print(store, days, &mut io::stdout().lock()).map_err(|e| {
+        match e.downcast::<io::Error>() {
+            Ok(io) => io,
+            Err(other) => io::Error::other(format!("{other:#}")),
+        }
+    }))
+}
+
+fn print(store: &Store, days: i64, out: &mut impl Write) -> Result<()> {
     let mut db = UsageDb::open(&store.usage_db_path())?;
     db.resolve_commits()?;
     let now = Utc::now();
@@ -32,7 +42,7 @@ pub fn run(store: &Store, days: i64) -> Result<()> {
                 continue;
             }
             if !header {
-                println!("\n== {project}");
+                writeln!(out, "\n== {project}")?;
                 header = true;
             }
             let status = journal::status(&item, now);
@@ -41,12 +51,13 @@ pub fn run(store: &Store, days: i64) -> Result<()> {
                 .as_str()
                 .map(|b| format!(" [{b}]"))
                 .unwrap_or_default();
-            println!(
+            writeln!(
+                out,
                 "{:<10} {}  {}{branch}",
                 status,
                 last_ts.with_timezone(&Local).format("%m-%d %H:%M"),
                 one_line(title, 90)
-            );
+            )?;
             let commits = item["commits"].as_array().map_or(0, Vec::len);
             let files = item["files"].as_array().map_or(0, Vec::len);
             let prompts = item["prompts"].as_u64().unwrap_or(0);
@@ -73,12 +84,15 @@ pub fn run(store: &Store, days: i64) -> Result<()> {
             if let Some(p) = item["pauses"].as_array().filter(|p| !p.is_empty()) {
                 facts.push(format!("{} pause(s)", p.len()));
             }
-            println!("           {}", facts.join(" · "));
+            writeln!(out, "           {}", facts.join(" · "))?;
             shown += 1;
         }
     }
     if shown == 0 {
-        println!("no work items in the last {days} day(s); run `clioilc usage import` first");
+        writeln!(
+            out,
+            "no work items in the last {days} day(s); run `clioilc usage import` first"
+        )?;
     }
     Ok(())
 }

@@ -54,6 +54,22 @@ pub fn run(
     // Checked every minute, so a schedule set later is picked up too.
     super::standup::spawn_schedule(Store::new(store.data_dir()), &STOP);
 
+    // Tools that keep their history in a database (Devin) are read too,
+    // whichever reader watches the log files.
+    for db_reader in readers::all() {
+        if db_reader.name() == reader.name() {
+            continue;
+        }
+        if let Some(path) = db_reader
+            .database()
+            .and_then(|d| d.path().ok())
+            .filter(|p| p.exists())
+        {
+            eprintln!("[{}] reading {}", db_reader.name(), path.display());
+            spawn_database_poll(Store::new(store.data_dir()), db_reader.name(), path, &STOP);
+        }
+    }
+
     // Appended lines are always read (to collect usage); --follow only
     // decides whether they are also printed.
     let opts = Options {
@@ -110,4 +126,56 @@ impl Handler for Output<'_> {
     fn on_error(&mut self, err: anyhow::Error) {
         eprintln!("watch error: {err:#}");
     }
+}
+
+/// How often a tool's database is checked for changes.
+const DB_POLL: Duration = Duration::from_secs(3);
+
+/// Reads a database-backed tool's new rows whenever its files change.
+fn spawn_database_poll(store: Store, name: &'static str, path: PathBuf, stop: &'static AtomicBool) {
+    std::thread::spawn(move || {
+        // Readers are not Send: the thread looks its own up.
+        let Ok(reader) = readers::find(Some(name)) else {
+            return;
+        };
+        let Some(source) = reader.database() else {
+            return;
+        };
+        let mut db = match clioilc_core::UsageDb::open(&store.usage_db_path()) {
+            Ok(db) => db,
+            Err(err) => return eprintln!("[{}] {err:#}", reader.name()),
+        };
+        let mut seen: Option<Vec<Option<std::time::SystemTime>>> = None;
+        let mut last_error: Option<String> = None;
+        while !stop.load(Ordering::SeqCst) {
+            // The database and its WAL: either changes when Devin writes.
+            let stamp: Vec<_> = ["", "-wal"]
+                .iter()
+                .map(|ext| {
+                    let mut p = path.clone().into_os_string();
+                    p.push(ext);
+                    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+                })
+                .collect();
+            if seen.as_ref() != Some(&stamp) {
+                match super::usage::pull_database(&mut db, reader.as_ref(), source, &path, false) {
+                    Ok(n) => {
+                        seen = Some(stamp);
+                        last_error = None;
+                        if n > 0 {
+                            eprintln!("[{}] {n} record(s)", reader.name());
+                        }
+                    }
+                    Err(err) => {
+                        let msg = format!("{err:#}");
+                        if last_error.as_deref() != Some(&msg) {
+                            eprintln!("[{}] {msg}", reader.name());
+                            last_error = Some(msg);
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(DB_POLL);
+        }
+    });
 }

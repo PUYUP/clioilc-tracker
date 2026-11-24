@@ -2,7 +2,7 @@ use crate::readers;
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use clioilc_core::usage_db::{GroupBy, ReportRow};
-use clioilc_core::{watcher, Reader, Store, UsageDb};
+use clioilc_core::{watcher, DatabaseSource, Reader, Store, UsageDb};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -55,8 +55,88 @@ impl<'a> Ingest<'a> {
     }
 }
 
+/// Where a database reader stopped (local only, kept in usage.db's meta).
+fn cursor_key(reader: &dyn Reader) -> String {
+    format!("cursor:{}", reader.name())
+}
+
+/// Stores the rows a database reader (e.g. Devin) added since its cursor,
+/// or since the start with `from_start` (stored data is deduplicated, so
+/// reading again is safe). Returns the number of records.
+pub fn pull_database(
+    db: &mut UsageDb,
+    reader: &dyn Reader,
+    source: &dyn DatabaseSource,
+    path: &Path,
+    from_start: bool,
+) -> Result<u64> {
+    let key = cursor_key(reader);
+    let cursor = if from_start {
+        0
+    } else {
+        db.local_value(&key)?
+            .and_then(|v| String::from_utf8(v).ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    let mut records = 0u64;
+    let mut failed: Option<anyhow::Error> = None;
+    let next = source.read_since(path, cursor, &mut |project, record| {
+        if failed.is_none() {
+            match db.insert(reader.name(), project, &record) {
+                Ok(()) => records += 1,
+                Err(e) => failed = Some(e),
+            }
+        }
+    })?;
+    if let Some(e) = failed {
+        return Err(e.context(format!("storing {} records", reader.name())));
+    }
+    db.set_local_value(&key, next.to_string().as_bytes())?;
+    db.commit()?;
+    db.resolve_commits()?;
+    Ok(records)
+}
+
+/// `usage import` for a database reader: everything, from the start.
+fn import_database(
+    store: &Store,
+    reader: &dyn Reader,
+    source: &dyn DatabaseSource,
+    path: Option<PathBuf>,
+) -> Result<()> {
+    let path = match path {
+        Some(p) => p,
+        None => source.path()?,
+    };
+    if !path.exists() {
+        anyhow::bail!(
+            "{} not found (is {} installed?)",
+            path.display(),
+            reader.name()
+        );
+    }
+    let started = Instant::now();
+    let mut db = UsageDb::open(&store.usage_db_path())?;
+    let records = pull_database(&mut db, reader, source, &path, true)?;
+    eprintln!(
+        "imported {} -> {records} record(s) in {:.2}s",
+        path.display(),
+        started.elapsed().as_secs_f64()
+    );
+    eprintln!("stored in {}", store.usage_db_path().display());
+    let items = db.build_work_items(chrono::Utc::now())?;
+    if items > 0 {
+        eprintln!("journal: {items} work item(s) updated");
+    }
+    Ok(())
+}
+
 pub fn import(store: &Store, reader: Option<&str>, path: Option<PathBuf>) -> Result<()> {
     let reader = readers::find(reader)?;
+    if let Some(source) = reader.database() {
+        return import_database(store, reader.as_ref(), source, path);
+    }
     let dir = match path {
         Some(p) => p,
         None => reader.default_watch_dir()?,

@@ -1,6 +1,6 @@
 # clioilc
 
-CLI untuk memantau file log dari tool AI (Claude Code, Gemini CLI, dll.):
+CLI untuk memantau riwayat tool AI (Claude Code, Devin CLI, Gemini CLI, dll.):
 
 - **mencatat event perubahan file** (dibuat, diubah, di-rename, dihapus) ke log lokal;
 - **membaca isi file secara realtime**, seperti `tail -F` untuk banyak file sekaligus. Hanya
@@ -197,6 +197,34 @@ Catatan:
   sebelum di-parse.
 - Tool call berstatus `NULL` (pending) artinya hasilnya belum ditulis, misalnya tool-nya
   masih berjalan.
+
+#### Devin CLI
+
+Devin CLI (Cognition/Windsurf) tidak menulis log, tetapi menyimpan riwayatnya di SQLite:
+`~/.local/share/devin/cli/sessions.db`. Reader `devin` membacanya **read-only**, mulai dari
+baris terakhir yang sudah dibaca. Posisi baca disimpan di `usage.db`, di tabel `meta` yang
+tidak pernah di-sync.
+
+```sh
+cargo run -q --release -- usage import --reader devin   # isi riwayat (aman diulang)
+cargo run -q --release -- watch                         # ikut membaca Devin kalau database-nya ada
+```
+
+`watch` mengecek file database dan WAL-nya setiap 3 detik. Saat ada perubahan, hanya baris
+baru yang dibaca. Ini berjalan bersamaan dengan pembacaan log Claude Code; tidak perlu proses
+kedua. `service install` otomatis ikut membaca Devin.
+
+| Di Devin | Di clioilc |
+|---|---|
+| node `assistant` (token dari `metadata.metrics`, model dari `generation_model`) | satu pesan; salinan node dengan `message_id` sama (fork atau render ulang) dihitung sekali |
+| `thinking.thinking`, `content` | blok thinking dan teks (privat) |
+| tool `exec`, `edit`, `write`, `read`, `grep`, … | dinamai seperti Claude Code: `Bash`, `Edit`, `Write`, `Read`, `Grep`, …, supaya journal mengenali edit, commit, dan push |
+| node `tool` + `tool_call_state` | hasil tool; gagal kalau status `failed` atau exit code perintah bukan 0 |
+| node `user` dengan `is_user_input` | prompt |
+| `sessions.working_directory` | proyek, dengan nama seperti Claude Code (`/Users/me/app` → `-Users-me-app`), jadi folder yang dikerjakan kedua agent menjadi satu proyek |
+
+Kalau Devin mengubah format datanya, node yang tidak bisa dibaca tidak dilewati diam-diam: `watch` dan
+`usage import` menampilkan jumlahnya sebagai peringatan.
 
 ### `journal`
 
@@ -782,6 +810,7 @@ Kasus khusus:
 Cargo.toml            workspace: versi, edition, dan dependency bersama
 core/                 clioilc-core: trait Reader, Store, watcher, tail
   src/reader.rs       trait Reader (name, default_watch_dir, extensions, project_name)
+                      dan DatabaseSource untuk tool yang menyimpan riwayat di database
   src/watcher.rs      loop notify, debounce event, integrasi --follow
   src/tail.rs         pembaca baris inkremental + checkpoint
   src/store.rs        events.jsonl
@@ -791,6 +820,7 @@ core/                 clioilc-core: trait Reader, Store, watcher, tail
   src/redact.rs       sensor rahasia untuk teks privat
 readers/claude/       reader ~/.claude/projects (project = folder pertama) + parser log
 readers/gemini/       reader ~/.gemini
+readers/devin/        reader Devin CLI: membaca sessions.db (SQLite) read-only per row_id
 clioilc/              binary CLI
   src/readers.rs      daftar reader (diubah otomatis oleh `add mod`)
   src/commands/       watch, history, summary, usage, activity, add

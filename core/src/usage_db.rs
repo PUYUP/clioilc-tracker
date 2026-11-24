@@ -676,6 +676,22 @@ impl UsageDb {
         Ok(true)
     }
 
+    /// A local-only value (never synced), e.g. a reader's read position.
+    pub fn local_value(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn set_local_value(&mut self, key: &str, value: &[u8]) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn conn(&self) -> &Connection {
         &self.conn
     }
