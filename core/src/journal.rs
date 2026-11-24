@@ -378,6 +378,14 @@ fn build(
                                 b.item.pending_edits = false;
                                 b.last_commit = Some(ts);
                             }
+                            // Only from a call that opens (or pushes to) a pull
+                            // request: a PR URL inside a file the agent read or
+                            // wrote, or in a test's output, is not this work's PR.
+                            let prs = if announces_pr(&name, &summary) {
+                                prs
+                            } else {
+                                Vec::new()
+                            };
                             for pr in prs {
                                 if !b.item.prs.contains(&pr) {
                                     b.item.prs.push(pr);
@@ -458,6 +466,41 @@ pub fn status(item: &serde_json::Value, now: DateTime<Utc>) -> &'static str {
 pub const PENDING_AFTER_SECS: i64 = 24 * 3600;
 /// Neither edited nor committed, and idle this long: abandoned.
 pub const ABANDONED_AFTER_SECS: i64 = 3 * 24 * 3600;
+
+/// Whether a tool call's output can name this work's pull request: a
+/// shell command that creates one (`gh pr create`, `glab mr create`, `hub
+/// pull-request`, `az repos pr create`) or pushes (forges print the open
+/// request of the branch), or an MCP tool that creates one.
+fn announces_pr(name: &str, summary: &str) -> bool {
+    if name.starts_with("mcp__") {
+        let tool = name
+            .rsplit("__")
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        return [
+            "pull_request",
+            "pullrequest",
+            "merge_request",
+            "mergerequest",
+        ]
+        .iter()
+        .any(|k| tool.contains(k))
+            && ["create", "open", "new"].iter().any(|k| tool.contains(k));
+    }
+    if name != "Bash" {
+        return false;
+    }
+    is_push(summary)
+        || summary.split(['&', ';', '|', '\n', '(', ')']).any(|s| {
+            let w: Vec<&str> = s.split_whitespace().collect();
+            let starts = |cmd: &[&str]| w.windows(cmd.len()).any(|x| x == cmd);
+            starts(&["gh", "pr", "create"])
+                || starts(&["glab", "mr", "create"])
+                || starts(&["hub", "pull-request"])
+                || starts(&["az", "repos", "pr", "create"])
+        })
+}
 
 fn is_push(summary: &str) -> bool {
     summary.split(['&', ';', '|', '\n']).any(|s| {
@@ -1029,6 +1072,45 @@ mod tests {
         assert_eq!(got[0].closed_by, Some("pr"));
         assert_eq!(got[0].errors.len(), 1);
         assert_eq!(got[0].errors[0].count, 3);
+    }
+
+    #[test]
+    fn only_calls_that_open_a_pull_request_name_it() {
+        let with_pr = |name: &str, summary: &str| {
+            let mut t = tool(name, summary, &[]);
+            if let Event::Tool { prs, .. } = &mut t {
+                prs.push("https://github.com/acme/pay/pull/42".into());
+            }
+            t
+        };
+        // A fixture or doc holding a PR URL, read, written or printed by tests.
+        for (name, summary) in [
+            ("Read", "/r/src/pr.test.js"),
+            ("Write", "/r/src/pr.test.js"),
+            ("Bash", "Run unit tests: npx vitest run"),
+            ("Bash", "cat docs/pr.md | grep pull"),
+            ("Bash", "gh pr view 42"),
+            ("mcp__github__get_pull_request", "acme/pay#42"),
+        ] {
+            let got = items(vec![(0, prompt("p1", None)), (10, with_pr(name, summary))]);
+            assert!(got[0].prs.is_empty(), "{name}: {summary}");
+            assert_ne!(got[0].closed_by, Some("pr"), "{name}: {summary}");
+        }
+        for (name, summary) in [
+            (
+                "Bash",
+                "Open the PR: git push -u origin x && gh pr create --fill",
+            ),
+            ("Bash", "glab mr create --fill"),
+            ("Bash", "git push origin fix/x"),
+            (
+                "mcp__github__create_pull_request",
+                "acme/pay: Retry payments",
+            ),
+        ] {
+            let got = items(vec![(0, prompt("p1", None)), (10, with_pr(name, summary))]);
+            assert_eq!(got[0].prs.len(), 1, "{name}: {summary}");
+        }
     }
 
     #[test]
