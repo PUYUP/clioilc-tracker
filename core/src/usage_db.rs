@@ -16,6 +16,7 @@
 //! can join them. Every synced row has a `synced_at` column (NULL = not yet
 //! uploaded), reset whenever the row changes.
 
+use crate::contract::{self, Tally};
 use crate::redact::redact;
 use crate::usage::{Message, Prompt, Record, Status, ToolResult, Usage};
 use anyhow::{Context, Result};
@@ -282,6 +283,9 @@ pub struct UsageDb {
     conn: Connection,
     salt: Vec<u8>,
     in_tx: bool,
+    /// Records that broke the reader contract since the last
+    /// [`UsageDb::take_contract`] (see [`crate::contract`]).
+    contract: Tally,
 }
 
 impl UsageDb {
@@ -300,12 +304,21 @@ impl UsageDb {
             conn,
             salt,
             in_tx: false,
+            contract: Tally::default(),
         })
     }
 
     /// Store one record parsed from a log of `tool` (the reader name).
     /// Writes are batched in a transaction until [`UsageDb::commit`].
+    ///
+    /// The record is checked against the reader contract first: one that
+    /// would corrupt the data is skipped, and broken rules are counted (see
+    /// [`UsageDb::take_contract`]).
     pub fn insert(&mut self, tool: &str, project: Option<&str>, record: &Record) -> Result<()> {
+        let problems = contract::check(tool, project, record, Utc::now());
+        if self.contract.add(&problems) {
+            return Ok(());
+        }
         if !self.in_tx {
             self.conn.execute_batch("BEGIN")?;
             self.in_tx = true;
@@ -316,6 +329,11 @@ impl UsageDb {
             Record::ToolResult(r) => self.insert_tool_result(r),
             Record::Prompt(p) => self.insert_prompt(project, p),
         }
+    }
+
+    /// Broken reader-contract rules counted since the last call.
+    pub fn take_contract(&mut self) -> Tally {
+        std::mem::take(&mut self.contract)
     }
 
     pub fn commit(&mut self) -> Result<()> {
@@ -333,6 +351,11 @@ impl UsageDb {
             Status::Ok => "ok".to_string(),
             Status::Error(kind) => label(kind, "api_error"),
         };
+        // The cache-write split, only when it adds up (the server refuses others).
+        let split = match (m.usage.cache_write_5m, m.usage.cache_write_1h) {
+            (Some(a), Some(b)) if a.checked_add(b) == Some(m.usage.cache_write) => Some((a, b)),
+            _ => None,
+        };
         self.conn.prepare_cached(UPSERT_MESSAGE)?.execute(params![
             id,
             label(tool, "unknown"),
@@ -346,8 +369,8 @@ impl UsageDb {
             to_i64(m.usage.cache_write),
             to_i64(m.usage.cache_read),
             to_i64(m.usage.output),
-            m.usage.cache_write_5m.map(to_i64),
-            m.usage.cache_write_1h.map(to_i64),
+            split.map(|(w5, _)| to_i64(w5)),
+            split.map(|(_, w1)| to_i64(w1)),
             m.speed.as_deref().map(|s| label(s, "unknown")),
         ])?;
 
@@ -411,7 +434,10 @@ impl UsageDb {
                 .prepare_cached(UPSERT_PRIVATE_TOOL_ERROR)?
                 .execute(params![id, private_text(error, MAX_ERROR)])?;
         }
-        if let Some(ts) = r.timestamp {
+        if let Some(ts) = r
+            .timestamp
+            .filter(|t| *t <= Utc::now() + chrono::Duration::days(1))
+        {
             self.conn
                 .prepare_cached(
                     "UPDATE private_tool_calls SET result_ts = ?2
@@ -419,19 +445,21 @@ impl UsageDb {
                 )?
                 .execute(params![id, private_ts(ts)])?;
         }
-        if !r.prs.is_empty() {
+        let prs: Vec<&String> = r.prs.iter().filter(|u| contract::is_pr_url(u)).collect();
+        if !prs.is_empty() {
             self.conn
                 .prepare_cached(
                     "UPDATE private_tool_calls SET prs = ?2, synced_at = NULL
                      WHERE id = ?1 AND prs IS NULL",
                 )?
-                .execute(params![id, serde_json::to_string(&r.prs)?])?;
+                .execute(params![id, serde_json::to_string(&prs)?])?;
         }
-        if !r.commits.is_empty() {
+        if r.commits.iter().any(|c| contract::is_commit_hash(&c.hash)) {
             // As printed; resolve_commits() completes them from the repository.
             let commits: Vec<_> = r
                 .commits
                 .iter()
+                .filter(|c| contract::is_commit_hash(&c.hash))
                 .map(|c| crate::git::Commit {
                     subject: private_text(&c.subject, 300),
                     ..c.clone()
@@ -553,7 +581,10 @@ impl UsageDb {
             .prepare_cached(
                 "INSERT OR IGNORE INTO private_projects (project_id, name) VALUES (?1, ?2)",
             )?
-            .execute(params![project_id, project])?;
+            .execute(params![
+                project_id,
+                truncate_plain(project, contract::MAX_PROJECT)
+            ])?;
         Ok(project_id)
     }
 
@@ -1358,12 +1389,19 @@ fn truncate(text: &str, max_chars: usize) -> String {
 /// A short identifier-like label (model, tool name, error kind); anything
 /// else is replaced by `fallback` so free text can never be stored.
 fn label(raw: &str, fallback: &str) -> String {
-    let ok = !raw.is_empty()
-        && raw.len() <= 64
-        && raw
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-.<>".contains(&b));
-    if ok { raw } else { fallback }.to_string()
+    if contract::is_label(raw) {
+        raw
+    } else {
+        fallback
+    }
+    .to_string()
+}
+
+/// The first `max_chars` characters, without a marker.
+fn truncate_plain(text: &str, max_chars: usize) -> &str {
+    text.char_indices()
+        .nth(max_chars)
+        .map_or(text, |(cut, _)| &text[..cut])
 }
 
 fn to_i64(v: u64) -> i64 {
@@ -1413,6 +1451,81 @@ mod tests {
 
     fn at(secs: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 11, 20, 1, 0, secs).unwrap()
+    }
+
+    #[test]
+    fn records_that_break_the_contract_are_skipped_or_cleaned() {
+        let mut db = db();
+        let count = |db: &UsageDb, table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        // An empty message id would merge unrelated responses: skipped.
+        let Record::Message(mut broken) = message("", "l1", 5, "hi", &[]) else {
+            unreachable!()
+        };
+        db.insert("claude", Some("p"), &Record::Message(broken.clone()))
+            .unwrap();
+        assert_eq!(count(&db, "messages"), 0);
+        // A split that does not add up: stored without it (the server refuses it).
+        broken.id = "m1".into();
+        broken.model = "Opus 5.5".into();
+        broken.usage.cache_write_5m = Some(3);
+        broken.usage.cache_write_1h = Some(3);
+        db.insert("claude", Some("p"), &Record::Message(broken))
+            .unwrap();
+        // Commits and PR links the server would refuse are dropped.
+        db.insert(
+            "claude",
+            None,
+            &Record::ToolResult(ToolResult {
+                tool_call_id: "t1".into(),
+                is_error: false,
+                error_text: None,
+                timestamp: None,
+                commits: vec![crate::git::Commit {
+                    hash: "NOT-A-HASH".into(),
+                    ..Default::default()
+                }],
+                prs: vec!["see PR 12".into()],
+            }),
+        )
+        .unwrap();
+        db.commit().unwrap();
+        let (model, w5): (String, Option<i64>) = db
+            .conn
+            .query_row(
+                "SELECT model, cache_write_5m_tokens FROM messages",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((model.as_str(), w5), ("unknown", None));
+        let (commits, prs): (Option<String>, Option<String>) = db
+            .conn
+            .query_row("SELECT commits, prs FROM private_tool_calls", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap_or((None, None));
+        assert_eq!((commits, prs), (None, None));
+
+        let tally = db.take_contract();
+        assert_eq!(tally.rejected.get("message.id is empty"), Some(&1));
+        assert_eq!(
+            tally
+                .warned
+                .get("message.model is not a label (stored as 'unknown')"),
+            Some(&1)
+        );
+        assert_eq!(
+            tally
+                .warned
+                .get("message.usage cache split does not add up to cache_write (split dropped)"),
+            Some(&1)
+        );
+        assert_eq!(tally.warned.len(), 4, "{tally:?}");
+        assert!(db.take_contract().is_empty(), "taking resets the counts");
     }
 
     fn message(

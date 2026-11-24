@@ -53,6 +53,20 @@ impl<'a> Ingest<'a> {
         self.db.resolve_commits()?;
         Ok(())
     }
+
+    /// Prints the reader-contract problems seen since the last call.
+    pub fn report_contract(&mut self) {
+        report_contract(&mut self.db, self.reader.name());
+    }
+}
+
+/// Prints (to stderr) the records a reader produced that broke the reader
+/// contract (docs/readers.md) since the last call: skipped ones and values
+/// stored with a fallback.
+pub fn report_contract(db: &mut UsageDb, reader: &str) {
+    for line in db.take_contract().report(reader) {
+        eprintln!("{line}");
+    }
 }
 
 /// Where a database reader stopped (local only, kept in usage.db's meta).
@@ -95,6 +109,7 @@ pub fn pull_database(
     db.set_local_value(&key, next.to_string().as_bytes())?;
     db.commit()?;
     db.resolve_commits()?;
+    report_contract(db, reader.name());
     Ok(records)
 }
 
@@ -179,6 +194,7 @@ pub fn import(store: &Store, reader: Option<&str>, path: Option<PathBuf>) -> Res
         }
         ingest.commit()?;
     }
+    ingest.report_contract();
 
     eprintln!(
         "imported {} file(s), {} line(s), {:.1} MB -> {} record(s) in {:.2}s",

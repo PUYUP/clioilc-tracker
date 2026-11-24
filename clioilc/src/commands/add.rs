@@ -129,6 +129,26 @@ impl Reader for {struct_name} {{
 
     // Override `project_name(&self, relative: &Path)` to group events by
     // project; it receives the file path relative to the watched directory.
+    //
+    // To read usage, override `parse_line(&self, line: &[u8]) -> Vec<Record>`
+    // (or `database()` when the tool keeps its history in a database). What
+    // it returns must follow the reader contract: docs/readers.md.
+}}
+
+#[cfg(test)]
+mod tests {{
+    use super::*;
+
+    /// Every record this reader yields must follow the reader contract
+    /// (docs/readers.md). Paste real lines from the tool's logs here.
+    #[test]
+    fn records_follow_the_contract() {{
+        let lines: &[&str] = &[];
+        for line in lines {{
+            let records = {struct_name}.parse_line(line.as_bytes());
+            clioilc_core::contract::assert_conforms("{name}", Some("-r-app"), &records);
+        }}
+    }}
 }}
 "#
     )

@@ -1,3 +1,4 @@
+pub mod contract;
 pub mod filter;
 pub mod git;
 pub mod journal;

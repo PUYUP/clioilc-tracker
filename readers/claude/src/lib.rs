@@ -509,8 +509,11 @@ mod tests {
         assert_eq!(r.project_name(Path::new("top-level.json")), None);
     }
 
+    /// Parses a line; what it yields must follow the reader contract.
     fn parse(line: &str) -> Vec<Record> {
-        ClaudeReader.parse_line(line.as_bytes())
+        let records = ClaudeReader.parse_line(line.as_bytes());
+        clioilc_core::contract::assert_conforms("claude", Some("-r-app"), &records);
+        records
     }
 
     #[test]

@@ -37,7 +37,7 @@ cargo run -q --release -- watch --follow \
   - [`login` / `sync` / `logout`](#login--sync--logout): kirim data ke dashboard
   - [`link` / `links` / `unlink`](#link--links--unlink): bagikan folder ke proyek tim
   - [`service`](#service): jalankan watcher otomatis di background
-  - [`add mod`](#add-mod): buat reader baru
+  - [`add mod`](#add-mod): buat reader baru (kontraknya: [docs/readers.md](docs/readers.md))
 - [Format output `--follow`](#format-output---follow)
 - [Contoh pipeline](#contoh-pipeline)
 - [Membaca token Claude](#membaca-token-claude)
@@ -538,6 +538,12 @@ cargo run -q --release -- add mod cursor
 Nama harus diawali huruf kecil, lalu hanya boleh berisi huruf kecil, angka, `-`, atau `_`.
 Nama `core` tidak boleh dipakai.
 
+Apa pun format log tool-nya, record yang keluar dari reader harus mengikuti
+**[kontrak reader](docs/readers.md)**: field wajib, nama tool kanonik (`Bash`, `Edit`, …), isi
+`summary`, dan aturan id. Kontrak ini diperiksa setiap kali data disimpan. `usage import` dan
+`watch` menampilkan record yang dilewati atau disimpan dengan nilai cadangan, dan template
+reader sudah berisi tes `records_follow_the_contract`.
+
 ## Format output `--follow`
 
 Setiap baris di stdout berbentuk:
@@ -816,12 +822,14 @@ core/                 clioilc-core: trait Reader, Store, watcher, tail
   src/store.rs        events.jsonl
   src/filter.rs       EventFilter untuk history/summary
   src/usage.rs        tipe Record (Message, ToolResult, Prompt) hasil parsing reader
+  src/contract.rs     kontrak reader: aturan yang diperiksa sebelum record disimpan
   src/usage_db.rs     SQLite tiga tingkat: hash, sanitasi, dedupe, report, activity
   src/redact.rs       sensor rahasia untuk teks privat
 readers/claude/       reader ~/.claude/projects (project = folder pertama) + parser log
 readers/gemini/       reader ~/.gemini
 readers/devin/        reader Devin CLI: membaca sessions.db (SQLite) read-only per row_id
 clioilc/              binary CLI
+docs/readers.md       kontrak reader: format Record yang harus keluar dari setiap reader
   src/readers.rs      daftar reader (diubah otomatis oleh `add mod`)
   src/commands/       watch, history, summary, usage, activity, add
 ```

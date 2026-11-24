@@ -20,7 +20,7 @@ const MAX_SUBJECT: usize = 300;
 /// Git subcommands that create commits.
 const COMMITTING: &[&str] = &["commit", "merge", "cherry-pick", "revert", "am"];
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commit {
     /// Full hash when the repository was found, else as printed (7+ chars).
     pub hash: String,

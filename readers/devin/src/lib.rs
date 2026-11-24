@@ -233,7 +233,10 @@ fn decode(row: &Row) -> Option<Node> {
 
 #[cfg(test)]
 fn parse_node(row: &Row, session: &Session) -> Vec<Record> {
-    decode(row).map_or_else(Vec::new, |node| records(row, session, node))
+    let out = decode(row).map_or_else(Vec::new, |node| records(row, session, node));
+    // What the reader yields must follow the reader contract (docs/readers.md).
+    clioilc_core::contract::assert_conforms("devin", Some("-r-app"), &out);
+    out
 }
 
 fn records(row: &Row, session: &Session, node: Node) -> Vec<Record> {

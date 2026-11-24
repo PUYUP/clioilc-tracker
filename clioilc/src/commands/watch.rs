@@ -118,6 +118,7 @@ impl Handler for Output<'_> {
         if let Err(err) = self.ingest.commit() {
             self.on_error(err.context("storing usage"));
         }
+        self.ingest.report_contract();
         if self.lines.as_mut().is_some_and(|out| out.flush().is_err()) {
             self.close();
         }
