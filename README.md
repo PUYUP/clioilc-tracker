@@ -366,9 +366,18 @@ protokol), `docs/auth.md` (device flow), dan `docs/encryption.md` (format e2e).
 ```sh
 ./target/release/clioilc login --server https://api.clioilc.com   # sekali per mesin
 ./target/release/clioilc sync                                      # upload yang belum terkirim
+./target/release/clioilc sync --resend                             # kirim ulang seluruh riwayat
 ./target/release/clioilc watch --sync                              # rekam + sync tiap 30 detik
 ./target/release/clioilc logout                                    # cabut token mesin ini
 ```
+
+**`sync`** menampilkan progress bar selama upload. **`sync --resend`** menandai seluruh riwayat
+lokal sebagai belum terkirim, lalu mengirim semuanya lagi, misalnya setelah data di server
+terhapus atau setelah pindah server. Ini aman diulang: server menyimpan data per id, jadi tidak
+ada yang terhitung dua kali. Kalau service di background sedang berjalan (dan memegang kunci
+sync), `sync` tidak berebut dengannya: riwayat tetap ditandai untuk dikirim ulang, lalu progress
+upload yang dikerjakan service ditampilkan sampai selesai. Ctrl-C hanya berhenti menampilkan
+progress; upload-nya tetap berjalan.
 
 **`login`** memakai device flow. CLI menampilkan kode dan membuka halaman `/device` di
 dashboard. Setelah kamu login dengan GitHub dan menyetujui kodenya, CLI menerima token.

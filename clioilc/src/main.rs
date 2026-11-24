@@ -96,7 +96,12 @@ enum Commands {
         path: Option<PathBuf>,
     },
     /// Upload data not yet on the server
-    Sync,
+    Sync {
+        /// Send the whole local history again, not only what is new (safe:
+        /// the server stores rows by id, nothing is counted twice)
+        #[arg(long)]
+        resend: bool,
+    },
     /// Run `watch --sync` in the background at login (launchd / systemd --user)
     Service {
         #[command(subcommand)]
@@ -347,7 +352,7 @@ fn main() -> Result<()> {
             state.map(|t| matches!(t, Toggle::On)),
         ),
         Commands::Unlink { path } => commands::link::unlink(&open_store(data_dir)?, path),
-        Commands::Sync => commands::sync::run(&open_store(data_dir)?),
+        Commands::Sync { resend } => commands::sync::run(&open_store(data_dir)?, resend),
         Commands::Service { command } => {
             let store = open_store(data_dir)?;
             match command {

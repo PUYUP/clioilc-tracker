@@ -67,6 +67,8 @@ pub struct Syncer {
     journal_dirty: bool,
     pub team_notes: Vec<String>,
     pub team_uploaded: usize,
+    /// Show a progress bar while uploading (`clioilc sync`, not `watch`).
+    progress: bool,
 }
 
 /// Team sync runs after the personal sync, at most this often unless new
@@ -76,6 +78,21 @@ const TEAM_EVERY: Duration = Duration::from_secs(300);
 /// events and asks git, about a second), and at least every TEAM_EVERY for
 /// what depends on time or on the repository (a push from a terminal).
 const JOURNAL_AFTER_ACTIVITY: Duration = Duration::from_secs(30);
+
+/// Another clioilc (usually the background service) holds the sync lock.
+#[derive(Debug)]
+pub struct Busy;
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "another clioilc is already syncing this data (the background service? see \
+             `clioilc service status`); this one keeps recording and takes over if it stops",
+        )
+    }
+}
+
+impl std::error::Error for Busy {}
 
 impl Syncer {
     /// Fails if not logged in, another sync holds the lock, or usage.db was
@@ -90,10 +107,7 @@ impl Syncer {
             .open(data_dir.join("sync.lock"))?;
         match lock.try_lock() {
             Ok(()) => {}
-            Err(TryLockError::WouldBlock) => bail!(
-                "another clioilc is already syncing this data (the background service? see \
-                 `clioilc service status`); this one keeps recording and takes over if it stops"
-            ),
+            Err(TryLockError::WouldBlock) => return Err(anyhow::Error::new(Busy)),
             Err(TryLockError::Error(e)) => return Err(e).context("locking sync.lock"),
         }
         let client = Client::new(&auth.server, Some(&auth.token))?;
@@ -117,6 +131,7 @@ impl Syncer {
             journal_dirty: false,
             team_notes: Vec::new(),
             team_uploaded: 0,
+            progress: false,
         };
         syncer.check_salt()?;
         // History synced to another account (e.g. after logging in as a new
@@ -207,14 +222,34 @@ impl Syncer {
 
     fn run_personal(&mut self) -> Result<Totals> {
         let mut totals = Totals::default();
+        let mut bar = if self.progress {
+            Progress::new(self.db.unsynced_total()?)
+        } else {
+            None
+        };
         loop {
             let batch = self.db.sync_claim(BATCH)?;
             if batch.is_empty() {
+                if let Some(bar) = bar.as_mut() {
+                    bar.finish();
+                }
                 return Ok(totals);
             }
+            let rows = batch.len() as u64;
             let sent = self.send(&batch);
             self.db.sync_finish(sent.is_ok(), chrono::Utc::now())?;
-            let counts = sent?;
+            let counts = match sent {
+                Ok(c) => c,
+                Err(e) => {
+                    if let Some(bar) = bar.as_mut() {
+                        bar.finish();
+                    }
+                    return Err(e);
+                }
+            };
+            if let Some(bar) = bar.as_mut() {
+                bar.add(rows);
+            }
             totals.messages += counts.messages;
             totals.tool_calls += counts.tool_calls;
             totals.private += counts.private;
@@ -275,8 +310,90 @@ fn explain(err: anyhow::Error) -> anyhow::Error {
     }
 }
 
-pub fn run(store: &Store) -> Result<()> {
-    let mut syncer = Syncer::open(store)?;
+/// Upload progress on stderr: a bar redrawn in place on a terminal, a line
+/// every 10% otherwise (logs, pipes).
+struct Progress {
+    total: u64,
+    done: u64,
+    started: std::time::Instant,
+    tty: bool,
+    last_tenth: u64,
+}
+
+impl Progress {
+    /// None when there is nothing (or very little) to show.
+    fn new(total: u64) -> Option<Self> {
+        use std::io::IsTerminal;
+        (total > BATCH as u64).then(|| Self {
+            total,
+            done: 0,
+            started: std::time::Instant::now(),
+            tty: std::io::stderr().is_terminal(),
+            last_tenth: 0,
+        })
+    }
+
+    fn add(&mut self, rows: u64) {
+        self.set(self.done + rows);
+    }
+
+    fn set(&mut self, done: u64) {
+        self.done = done;
+        // A batch can hold rows queued after the count (a running watcher).
+        self.total = self.total.max(self.done);
+        if self.tty {
+            eprint!("\r{}", self.line());
+        } else {
+            let tenth = self.done * 10 / self.total.max(1);
+            if tenth > self.last_tenth {
+                self.last_tenth = tenth;
+                eprintln!("{}", self.line());
+            }
+        }
+    }
+
+    fn line(&self) -> String {
+        const WIDTH: usize = 30;
+        let ratio = self.done as f64 / self.total.max(1) as f64;
+        let filled = ((ratio * WIDTH as f64).round() as usize).min(WIDTH);
+        let secs = self.started.elapsed().as_secs_f64();
+        let eta = if self.done > 0 && ratio < 1.0 {
+            format!(", ~{:.0}s left", secs / ratio - secs)
+        } else {
+            String::new()
+        };
+        format!(
+            "[{}{}] {:>3.0}%  {}/{} rows  {:.0}s{eta}   ",
+            "#".repeat(filled),
+            "-".repeat(WIDTH - filled),
+            ratio * 100.0,
+            self.done,
+            self.total,
+            secs
+        )
+    }
+
+    fn finish(&mut self) {
+        if self.tty && self.done > 0 {
+            eprintln!();
+        }
+    }
+}
+
+/// `clioilc sync`: upload what is pending, with a progress bar. With
+/// `resend`, first mark the whole local history as not uploaded, so all of
+/// it goes again (safe: the server stores rows by id).
+pub fn run(store: &Store, resend: bool) -> Result<()> {
+    let mut syncer = match Syncer::open(store) {
+        Ok(s) => s,
+        Err(e) if e.is::<Busy>() => return follow_service(store, resend),
+        Err(e) => return Err(e),
+    };
+    syncer.progress = true;
+    if resend {
+        let n = syncer.db.mark_all_unsynced()?;
+        eprintln!("resending the whole history: {n} row(s) queued again");
+    }
     let totals = syncer.run()?;
     if totals.is_empty() {
         eprintln!("up to date ({})", syncer.auth.server);
@@ -352,4 +469,53 @@ pub fn spawn_loop(store: Store, every: Duration, stop: &'static AtomicBool) {
             }
         }
     });
+}
+
+/// The background service holds the sync lock: queue the history again if
+/// asked, then show the service's upload progress until nothing is pending.
+fn follow_service(store: &Store, resend: bool) -> Result<()> {
+    const POLL: Duration = Duration::from_secs(1);
+    const STALLED: Duration = Duration::from_secs(180);
+    let mut db = UsageDb::open(&store.usage_db_path())?;
+    if resend {
+        let n = db.mark_all_unsynced()?;
+        eprintln!("resending the whole history: {n} row(s) queued again");
+    }
+    let total = db.unsynced_total()?;
+    if total == 0 {
+        eprintln!("up to date (the background service keeps it so)");
+        return Ok(());
+    }
+    eprintln!(
+        "the background service is uploading {total} row(s); following its progress \
+         (Ctrl-C stops watching, not the upload)"
+    );
+    let mut bar = Progress::new(total);
+    let (mut last, mut moved) = (total, std::time::Instant::now());
+    loop {
+        std::thread::sleep(POLL);
+        let pending = db.unsynced_total()?;
+        if let Some(bar) = bar.as_mut() {
+            bar.set(total.saturating_sub(pending));
+        }
+        if pending == 0 {
+            if let Some(bar) = bar.as_mut() {
+                bar.finish();
+            }
+            eprintln!("done: the background service uploaded {total} row(s)");
+            return Ok(());
+        }
+        if pending < last {
+            (last, moved) = (pending, std::time::Instant::now());
+        } else if moved.elapsed() >= STALLED {
+            if let Some(bar) = bar.as_mut() {
+                bar.finish();
+            }
+            bail!(
+                "no upload progress for {} minutes; {pending} row(s) still pending \
+                 (see `clioilc service status`)",
+                STALLED.as_secs() / 60
+            );
+        }
+    }
 }

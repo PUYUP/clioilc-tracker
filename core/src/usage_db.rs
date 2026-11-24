@@ -665,6 +665,29 @@ impl UsageDb {
     }
 
     /// Rows waiting to be uploaded, per table.
+    /// Marks every uploaded row as not uploaded, so the next sync sends the
+    /// whole history again (`clioilc sync --resend`). The server stores rows
+    /// by id, so nothing is counted twice. Returns how many rows were marked.
+    pub fn mark_all_unsynced(&mut self) -> Result<u64> {
+        self.commit()?;
+        let mut n = 0;
+        for table in PUBLIC_TABLES.iter().chain(PRIVATE_TABLES) {
+            n += self.conn.execute(
+                &format!(
+                    "UPDATE {table} SET synced_at = NULL
+                     WHERE synced_at IS NOT NULL AND synced_at != '{SENDING}'"
+                ),
+                [],
+            )? as u64;
+        }
+        Ok(n)
+    }
+
+    /// Rows waiting for upload, all tables together.
+    pub fn unsynced_total(&self) -> Result<u64> {
+        Ok(self.unsynced()?.iter().map(|(_, n)| n).sum())
+    }
+
     pub fn unsynced(&self) -> Result<Vec<(&'static str, u64)>> {
         PUBLIC_TABLES
             .iter()
@@ -1451,6 +1474,26 @@ mod tests {
 
     fn at(secs: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 11, 20, 1, 0, secs).unwrap()
+    }
+
+    #[test]
+    fn mark_all_unsynced_queues_the_history_again() {
+        let mut db = db();
+        db.insert(
+            "claude",
+            Some("p"),
+            &message("m1", "l1", 5, "hi", &[("t1", "Bash", "ls")]),
+        )
+        .unwrap();
+        db.commit().unwrap();
+        let pending = db.unsynced_total().unwrap();
+        assert!(pending > 0);
+        let batch = db.sync_claim(1000).unwrap();
+        assert!(!batch.is_empty());
+        db.sync_finish(true, at(9)).unwrap();
+        assert_eq!(db.unsynced_total().unwrap(), 0);
+        assert_eq!(db.mark_all_unsynced().unwrap(), pending);
+        assert_eq!(db.unsynced_total().unwrap(), pending);
     }
 
     #[test]
