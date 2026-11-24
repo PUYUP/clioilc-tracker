@@ -5,6 +5,7 @@ pub mod journal;
 pub mod link;
 pub mod login;
 pub mod service;
+pub mod standup;
 pub mod summary;
 pub mod sync;
 pub mod team;

@@ -33,6 +33,7 @@ cargo run -q --release -- watch --follow \
   - [`history`](#history) dan [`summary`](#summary)
   - [`usage import` / `usage report`](#usage): token usage
   - [`activity`](#activity): apa yang dikerjakan agent hari ini
+  - [`standup`](#standup): ringkasan harian ke Slack, Discord, atau Teams
   - [`login` / `sync` / `logout`](#login--sync--logout): kirim data ke dashboard
   - [`link` / `links` / `unlink`](#link--links--unlink): bagikan folder ke proyek tim
   - [`service`](#service): jalankan watcher otomatis di background
@@ -221,6 +222,55 @@ Status: `active` (berjalan), `pending` (ada perubahan belum di-commit, tanpa akt
 24 jam), `committed` (belum di-push), `done` (di-push, PR, atau selesai di luar agent),
 `abandoned`, `discarded` (perubahan dibuang). Perubahan yang belum di-commit tetap satu item
 berapa lama pun jedanya.
+
+### `standup`
+
+Ringkasan harian dari work item: yang selesai, yang sudah di-commit, yang sedang berjalan, yang
+tertunda (perubahan belum di-commit, masih disebut sampai 7 hari), dan error yang terus
+berulang. Disusun **di laptop ini**, jadi tetap bisa dipakai untuk akun E2E.
+
+```sh
+cargo run -q --release -- standup                 # tampilkan 24 jam terakhir
+cargo run -q --release -- standup --days 3
+
+# kirim ke chat: URL incoming webhook disimpan hanya di laptop ini (standup.json, 0600)
+cargo run -q --release -- standup webhook https://hooks.slack.com/services/…
+cargo run -q --release -- standup --send          # kirim sekarang (sekaligus mencoba webhook-nya)
+cargo run -q --release -- standup schedule 09:00  # setiap hari kerja jam 09:00
+cargo run -q --release -- standup schedule 09:00 --weekends
+cargo run -q --release -- standup schedule --off
+cargo run -q --release -- standup webhook --remove
+```
+
+```
+Standup, Tue, Nov 24 (last 24 hours)
+
+Done
+• api: Retry payments (2 commits, PR #42)
+
+In progress
+• api: Fix flaky test
+
+Pending (changes not committed)
+• web: Login page (idle 2d)
+
+Keeps failing
+• 4× Bash: cargo test failed
+```
+
+- **Format pesan mengikuti URL webhook:** `hooks.slack.com` → Slack; `discord.com/api/webhooks/…` →
+  Discord (maks. 2000 karakter, tanpa mention); `*.webhook.office.com`, `*.logic.azure.com`,
+  `*.powerplatform.com` → Teams (Adaptive Card); selain itu `{"text": …}`. Hanya `https://`.
+- **Jadwal dijalankan oleh `watch`** (termasuk yang dipasang lewat `service install`), dicek
+  setiap menit. Kalau laptop mati pada jam itu, laporan dikirim saat `watch` berjalan lagi di hari
+  yang sama. Satu laporan per hari. Laporan hari Senin mencakup akhir pekan (kecuali
+  `--weekends`). Kalau webhook gagal, error-nya ditulis ke log watcher, dan laporan hari itu tidak
+  diulang.
+- **Yang terkirim ke chat:** judul work item (baris pertama prompt, sudah melalui sensor rahasia),
+  nama proyek yang dipendekkan, jumlah commit, nomor PR, dan potongan pesan error berulang.
+  Isi prompt lengkap, balasan agent, dan path file tidak ikut.
+- URL webhook tidak pernah ditampilkan utuh: `standup webhook` tanpa argumen hanya menampilkan
+  host-nya.
 
 ### `activity`
 
@@ -698,6 +748,7 @@ Semua ada di `--data-dir` (default `~/.clioilc`):
 | `usage.db` | Token usage dan timeline aktivitas (SQLite), lihat [Database dan privasi](#database-dan-privasi) |
 | `auth.json` | Hasil `login`: server, token perangkat, mode enkripsi, dan (mode e2e) data key. Permission 0600 |
 | `sync.lock` | Mencegah dua `sync` berjalan bersamaan |
+| `standup.json` | URL webhook dan jadwal `standup`. Permission 0600, tidak pernah di-sync |
 | `watch.log` | Output watcher yang dijalankan oleh `service install` (sync, error) |
 | `usage.db.before-login-*` | Backup saat `login` membangun ulang `usage.db` dengan salt akun |
 

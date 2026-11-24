@@ -102,6 +102,17 @@ enum Commands {
         #[command(subcommand)]
         command: ServiceCommands,
     },
+    /// A standup of the last day: printed, or sent to Slack, Discord or Teams
+    Standup {
+        #[command(subcommand)]
+        command: Option<StandupCommands>,
+        /// How many days back (by last activity)
+        #[arg(long, default_value_t = 1)]
+        days: i64,
+        /// Send it to the webhook set with `clioilc standup webhook`
+        #[arg(long)]
+        send: bool,
+    },
     /// Work items of the last days: what was done, what is pending (private)
     Journal {
         /// How many days back (by last activity)
@@ -183,6 +194,28 @@ enum UsageCommands {
         /// Group rows by
         #[arg(long, value_enum, default_value_t = commands::usage::By::Model)]
         by: commands::usage::By,
+    },
+}
+
+#[derive(Subcommand)]
+enum StandupCommands {
+    /// Show, set or remove the chat webhook (kept only on this machine)
+    Webhook {
+        /// Incoming webhook URL (Slack, Discord, Teams Workflows, or any that takes {"text": …})
+        url: Option<String>,
+        #[arg(long, conflicts_with = "url")]
+        remove: bool,
+    },
+    /// Send the standup every weekday at a local time while `clioilc watch` runs
+    Schedule {
+        /// Local time, HH:MM
+        at: Option<String>,
+        /// Also on Saturday and Sunday
+        #[arg(long)]
+        weekends: bool,
+        /// Stop sending it
+        #[arg(long, conflicts_with_all = ["at", "weekends"])]
+        off: bool,
     },
 }
 
@@ -290,6 +323,19 @@ fn main() -> Result<()> {
         ),
         Commands::Links => commands::link::links(&open_store(data_dir)?),
         Commands::Journal { days } => commands::journal::run(&open_store(data_dir)?, days),
+        Commands::Standup {
+            command: None,
+            days,
+            send,
+        } => commands::standup::run(&open_store(data_dir)?, days, send),
+        Commands::Standup {
+            command: Some(StandupCommands::Webhook { url, remove }),
+            ..
+        } => commands::standup::webhook(&open_store(data_dir)?, url, remove),
+        Commands::Standup {
+            command: Some(StandupCommands::Schedule { at, weekends, off }),
+            ..
+        } => commands::standup::schedule(&open_store(data_dir)?, at, off, weekends),
         Commands::Team { command: None } => {
             commands::sync::Syncer::open(&open_store(data_dir)?)?.team()
         }

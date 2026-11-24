@@ -48,6 +48,12 @@ pub fn run(
         super::sync::spawn_loop(Store::new(store.data_dir()), every, &STOP);
     }
 
+    if super::standup::load(store.data_dir()).is_ok_and(|c| c.at.is_some()) {
+        eprintln!("standup: scheduled (see `clioilc standup schedule`)");
+    }
+    // Checked every minute, so a schedule set later is picked up too.
+    super::standup::spawn_schedule(Store::new(store.data_dir()), &STOP);
+
     // Appended lines are always read (to collect usage); --follow only
     // decides whether they are also printed.
     let opts = Options {
