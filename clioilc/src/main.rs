@@ -118,6 +118,26 @@ enum Commands {
         #[arg(long)]
         send: bool,
     },
+    /// Signed record of which commits of a release AI agents helped with (for audits)
+    #[command(args_conflicts_with_subcommands = true)]
+    Attest {
+        #[command(subcommand)]
+        command: Option<AttestCommands>,
+        /// The release: a tag (or any commit) in this repository
+        release: Option<String>,
+        /// Compare with this tag or commit (default: the tag before the release)
+        #[arg(long)]
+        base: Option<String>,
+        /// Attest with the whole team's work in this workspace (default: yours)
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Where to save the signed envelope (default: attestation-<release>.json)
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+        /// The repository's folder (default: the current folder)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
     /// Work items of the last days: what was done, what is pending (private)
     Journal {
         /// How many days back (by last activity)
@@ -199,6 +219,18 @@ enum UsageCommands {
         /// Group rows by
         #[arg(long, value_enum, default_value_t = commands::usage::By::Model)]
         by: commands::usage::By,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AttestCommands {
+    /// Check an attestation's signature with the server's public key
+    Verify {
+        /// The attestation file (the signed envelope)
+        file: PathBuf,
+        /// Server whose key signed it (default: the one you are logged in to)
+        #[arg(long)]
+        server: Option<String>,
     },
 }
 
@@ -328,6 +360,29 @@ fn main() -> Result<()> {
         ),
         Commands::Links => commands::link::links(&open_store(data_dir)?),
         Commands::Journal { days } => commands::journal::run(&open_store(data_dir)?, days),
+        Commands::Attest {
+            command: Some(AttestCommands::Verify { file, server }),
+            ..
+        } => commands::attest::verify(&open_store(data_dir)?, &file, server),
+        Commands::Attest {
+            command: None,
+            release,
+            base,
+            workspace,
+            output,
+            path,
+        } => {
+            let release =
+                release.ok_or_else(|| anyhow::anyhow!("name the release: clioilc attest <tag>"))?;
+            commands::attest::run(
+                &open_store(data_dir)?,
+                &release,
+                base,
+                workspace,
+                output,
+                path,
+            )
+        }
         Commands::Standup {
             command: None,
             days,

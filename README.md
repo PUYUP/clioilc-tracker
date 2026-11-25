@@ -36,6 +36,7 @@ cargo run -q --release -- watch --follow \
   - [`standup`](#standup): ringkasan harian ke Slack, Discord, atau Teams
   - [`login` / `sync` / `logout`](#login--sync--logout): kirim data ke dashboard
   - [`link` / `links` / `unlink`](#link--links--unlink): bagikan folder ke proyek tim
+  - [`attest`](#attest): atestasi rilis untuk audit
   - [`service`](#service): jalankan watcher otomatis di background
   - [`add mod`](#add-mod): buat reader baru (kontraknya: [docs/readers.md](docs/readers.md))
 - [Format output `--follow`](#format-output---follow)
@@ -502,6 +503,29 @@ dengan kunci proyek, dan server hanya menyimpan ciphertext.
   langsung menghentikan pengiriman teks.
 - Selama kunci proyek **perlu dirotasi** (ada anggota yang keluar), unggahan untuk proyek itu
   ditahan sampai pengelola memasang versi baru. Datanya tetap aman di laptop.
+
+### `attest`
+
+Atestasi rilis untuk audit: commit mana dari sebuah rilis yang dibantu agent AI, oleh siapa,
+dengan model apa, dan berapa biayanya. Hasilnya ditandatangani server dalam format standar
+in-toto/DSSE. Detailnya ada di `backend/docs/attestations.md`.
+
+```sh
+cd ~/code/acme-api
+clioilc attest v1.4.0                       # dibanding tag sebelumnya
+clioilc attest v1.4.0 --base v1.3.0 --workspace acme -o audit/v1.4.0.json
+clioilc attest verify audit/v1.4.0.json     # cek tanda tangan dengan public key server
+```
+
+- **Daftar commit rilis dihitung di laptop** dengan `git rev-list base..rilis`. Base default-nya
+  tag sebelum rilis, dan repositorinya dinamai dari remote git. Server mencocokkan commit itu
+  dengan work item yang terlihat (milik sendiri, atau tim dengan `--workspace`), lalu
+  menandatanganinya.
+- **Isi prompt tidak ikut.** Per commit hanya ada anggota, agent, model, work item, dan biaya.
+- **`verify`** memeriksa tanda tangan di laptop dengan public key server
+  (`/api/v1/usage/attestations/key/`). File yang diubah sedikit saja akan ditolak.
+- Atestasi juga tampil di dashboard, di halaman **Releases**.
+- Akun dan workspace E2E belum didukung, karena server tidak bisa membaca work item-nya.
 
 ### `service`
 
