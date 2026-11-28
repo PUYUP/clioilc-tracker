@@ -15,7 +15,7 @@ clap.workspace = true
 ctrlc.workspace = true
 clioilc-core.workspace = true
 ureq = { version = "3", features = ["json"] }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 # E2E format v2 (team keys): HPKE with X-Wing (ML-KEM-768 + X25519), Ed25519.
 # Pinned: X-Wing follows an IETF draft, so upgrades must pass the v2 fixture.
 hpke = { version = "=0.15.1", default-features = false, features = ["alloc", "getrandom", "aes", "hkdfsha2", "mlkem", "x25519"] }
