@@ -8,6 +8,7 @@ description = "CLI for clioilc file-change tracking"
 clioilc-claude = { path = "../readers/claude" }
 clioilc-gemini = { path = "../readers/gemini" }
 clioilc-devin = { path = "../readers/devin" }
+clioilc-antigravity = { path = "../readers/antigravity" }
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true

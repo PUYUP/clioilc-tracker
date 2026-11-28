@@ -7,6 +7,7 @@ pub fn all() -> Vec<Box<dyn Reader>> {
         Box::new(clioilc_claude::ClaudeReader),
         Box::new(clioilc_gemini::GeminiReader),
         Box::new(clioilc_devin::DevinReader),
+        Box::new(clioilc_antigravity::AntigravityReader),
         // clioilc-add-mod:insert-here
     ]
 }
