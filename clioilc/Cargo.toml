@@ -22,7 +22,7 @@ hpke = { version = "=0.15.1", default-features = false, features = ["alloc", "ge
 ed25519-dalek = "3"
 sha2.workspace = true
 argon2 = "0.5"
-base64 = "0.22"
+base64 = "0.23"
 getrandom = "0.3"
 rpassword = "7"
 gethostname = "1"
