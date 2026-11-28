@@ -159,10 +159,10 @@ mod tests {
 
     #[test]
     fn only_https_or_localhost() {
-        assert!(Client::new("https://api.example.com", None).is_ok());
+        assert!(Client::new("https://io.example.com", None).is_ok());
         assert!(Client::new("http://localhost:8000/", None).is_ok());
         assert!(Client::new("http://127.0.0.1:8000", None).is_ok());
-        assert!(Client::new("http://api.example.com", None).is_err());
+        assert!(Client::new("http://io.example.com", None).is_err());
         assert!(Client::new("http://localhost.evil.com", None).is_err());
     }
 }
