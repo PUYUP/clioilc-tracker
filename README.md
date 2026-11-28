@@ -63,6 +63,18 @@ Semua contoh di bawah memakai `cargo run -q --release -- <perintah>`. `-q` menye
 pesan kompilasi dari cargo, dan `--` memisahkan argumen cargo dari argumen clioilc. Kalau
 binary-nya sudah di-build, ganti dengan `./target/release/clioilc <perintah>`.
 
+### Binary dari GitHub Release
+
+Setiap arsip di halaman Release punya *build provenance* bertanda tangan (Sigstore). Cek
+sebelum dipakai, supaya terbukti arsip itu dibuat oleh workflow repo ini dari tag rilisnya:
+
+```sh
+gh attestation verify clioilc-aarch64-apple-darwin.tar.gz --repo <owner>/<repo>
+```
+
+Binary macOS belum ditandatangani Apple (belum di-notarize), jadi Gatekeeper menolaknya saat
+pertama dijalankan. Setelah verifikasi di atas berhasil: `xattr -d com.apple.quarantine clioilc`.
+
 ## Perintah
 
 Opsi global:
